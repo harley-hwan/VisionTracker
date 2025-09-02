@@ -1,16 +1,17 @@
 #include "pch.h"
-#include <thread>
-#include <chrono>
-#include <mutex>
-#include <atomic>
-#include <string>
-#include <fstream>
-#include <vector>
-#include <regex>
+//#include <thread>
+//#include <chrono>
+//#include <mutex>
+//#include <atomic>
+//#include <string>
+//#include <fstream>
+//#include <vector>
+//#include <regex>
+//#include <sstream>
+//#include <algorithm>
+//#include <Windows.h> 
+//#include <opencv2/opencv.hpp>
 #include "IVisionTracker.h"
-#include <opencv2/opencv.hpp>
-#include <sstream>
-#include <Windows.h> 
 
 #ifdef min
 #undef min
@@ -18,7 +19,6 @@
 #ifdef max
 #undef max
 #endif
-#include <algorithm>
 
 extern "C" {
 #include "MvCameraControl.h"

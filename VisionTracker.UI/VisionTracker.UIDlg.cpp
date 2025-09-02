@@ -1,10 +1,9 @@
-// VisionTracker.UIDlg.cpp : 구현 파일
-//
-
 #include "pch.h"
 #include "VisionTracker.UI.h"
 #include "VisionTracker.UIDlg.h"
 #include "afxdialogex.h"
+
+//#include "../VisionTracker.Core/IVisionTracker.h"
 
 #ifdef _DEBUG
 #define new DEBUG_NEW

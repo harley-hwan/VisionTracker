@@ -1,5 +1,8 @@
 #pragma once
+#ifndef PCH_H
 #include <opencv2/opencv.hpp>
+#include <vector>
+#endif
 
 #ifdef VISIONTRACKER_CORE_EXPORTS
 #define VISIONTRACKER_API __declspec(dllexport)
