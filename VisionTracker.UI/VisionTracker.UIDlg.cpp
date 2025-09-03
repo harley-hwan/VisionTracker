@@ -3,8 +3,6 @@
 #include "VisionTracker.UIDlg.h"
 #include "afxdialogex.h"
 
-//#include "../VisionTracker.Core/IVisionTracker.h"
-
 #ifdef _DEBUG
 #define new DEBUG_NEW
 #endif
@@ -53,8 +51,8 @@ CVisionTrackerUIDlg::CVisionTrackerUIDlg(CWnd* pParent /*=NULL*/)
     , m_i_cropsizeh(480)
     , m_f_fps(120)
     , m_f_exposure(120)
-    , m_f_gamma(0.7f)
-    , m_f_gain(6.0f)
+    , m_f_gamma(0.8f)
+    , m_f_gain(11.0f)
     , m_i_blacklevel(30)
     , m_bInitialized(FALSE)
     , m_bConnected(FALSE)
@@ -357,11 +355,11 @@ void CVisionTrackerUIDlg::OnBnClickedButtonConnectCamera()
         EnableCameraControls(TRUE);
 
         // 현재 설정값 읽기
-        GetGain(&m_f_gain);
-        GetBlackLevel(&m_i_blacklevel);
-        GetFrameRate(&m_f_fps);
-        GetExposureTime(&m_f_exposure);
-        GetGamma(&m_f_gamma);
+        //GetGain(&m_f_gain);
+        //GetBlackLevel(&m_i_blacklevel);
+        //GetFrameRate(&m_f_fps);
+        //GetExposureTime(&m_f_exposure);
+        //GetGamma(&m_f_gamma);
         UpdateData(FALSE);
 
         SetDlgItemText(IDC_STATIC_SYSTEM_STATUS, _T("카메라 연결 성공"));
@@ -528,7 +526,7 @@ void CVisionTrackerUIDlg::OnBnClickedButton1()
         config.maxRadius = 10.0f;
         config.minCircularity = 0.8f;
         config.maxCircularity = 1.2f;
-        config.useTracking = true;
+        config.useTracking = false;  // 이전 프레임 추적 사용 안함
 
         SetWhiteBallDetectionConfig(config);
     }
@@ -718,95 +716,34 @@ void CVisionTrackerUIDlg::OnTimer(UINT_PTR nIDEvent)
             disp = img.clone(); // clone 추가
         }
 
-        // 1) DLL의 state 조회
-        BallTrackingState st = GetBallTrackingState();
+        // 추적이 활성화된 경우 공 위치 표시
+        if (m_isTrackingOn) {
+            float x, y, radius;
+            bool found;
+            GetCurrentBallPosition(&x, &y, &radius, &found);
 
-        // 2) 상태 포함 궤적 오버레이
-        int n = GetBallTrajectoryCount();
-        cv::Point prev;
-        bool hasPrev = false;
+            if (found) {
+                // 공의 위치에 초록색 원 그리기
+                cv::circle(disp, cv::Point((int)x, (int)y), (int)radius, cv::Scalar(0, 255, 0), 2);
+                cv::circle(disp, cv::Point((int)x, (int)y), 2, cv::Scalar(0, 0, 255), -1);
 
-        for (int i = 0; i < n; ++i) {
-            float x, y, R;
-            int frameIdx, stInt;
-            if (GetBallTrajectoryAtEx(i, &x, &y, &R, &frameIdx, &stInt)) {
-                BallTrackingState stPt = static_cast<BallTrackingState>(stInt);
-
-                // DONE 마커(-1,-1,0)는 "선 끊기"로 해석
-                if (stPt == BallTrackingState::DONE || x < 0 || y < 0) {
-                    hasPrev = false;
-                    continue;
-                }
-
-                cv::Point p((int)x, (int)y);
-                // 점(파랑), 선(파랑)
-                cv::circle(disp, p, 2, cv::Scalar(255, 0, 0), -1);
-                if (hasPrev) cv::line(disp, prev, p, cv::Scalar(255, 0, 0), 1);
-
-                prev = p;
-                hasPrev = true;
-            }
-        }
-
-        // 마지막 원 강조(가능하면 마지막 '유효 좌표'를 사용)
-        float lx = 0, ly = 0, lR = 0;
-        int lf = 0, ls = 0;
-        for (int i = n - 1; i >= 0; --i) {
-            if (GetBallTrajectoryAtEx(i, &lx, &ly, &lR, &lf, &ls) && lx >= 0 && ly >= 0) {
-                cv::circle(disp, cv::Point((int)lx, (int)ly), (int)lR, cv::Scalar(0, 255, 0), 2);
+                // 좌표 정보 표시
                 CString info;
-                info.Format(_T("points=%d, last=(%.0f,%.0f), r=%.0f"), n, lx, ly, lR);
+                info.Format(_T("Ball Position: (%.0f, %.0f), Radius: %.0f"), x, y, radius);
                 m_ballInfoCtrl.SetWindowText(info);
-                break;
             }
-        }
-        if (n == 0) {
-            m_ballInfoCtrl.SetWindowText(_T("Tracking..."));
-        }
-
-        // 3) 오버레이된 영상 출력 - 더블 버퍼링 사용
-        ShowMatToStatic(disp, m_imageCtrl);
-
-        // 4) 상태 정보 업데이트
-        CString strState;
-        switch (st) {
-        case BallTrackingState::IDLE: strState = _T("IDLE"); break;
-        case BallTrackingState::FIND: strState = _T("FIND"); break;
-        case BallTrackingState::READY: strState = _T("READY"); break;
-        case BallTrackingState::MOVE: strState = _T("MOVE"); break;
-        case BallTrackingState::DONE: strState = _T("DONE"); break;
-        }
-        SetDlgItemText(IDC_STATIC_TRACKING_STATE, strState);
-
-        // 궤적 포인트 수 표시
-        CString strPoints;
-        strPoints.Format(_T("%d"), n);
-        SetDlgItemText(IDC_STATIC_TRAJECTORY_POINTS, strPoints);
-
-        // CSV 파일 경로 표시
-        const char* csvPath = GetCurrentCsvPath();
-        if (csvPath && strlen(csvPath) > 0) {
-            CString strPath(csvPath);
-            // 파일명만 추출
-            int pos = strPath.ReverseFind(_T('\\'));
-            if (pos >= 0) {
-                strPath = strPath.Mid(pos + 1);
+            else {
+                m_ballInfoCtrl.SetWindowText(_T("Ball Not Found"));
             }
-            SetDlgItemText(IDC_STATIC_CSV_FILE, strPath);
         }
         else {
-            SetDlgItemText(IDC_STATIC_CSV_FILE, _T("없음"));
+            m_ballInfoCtrl.SetWindowText(_T("Tracking OFF"));
         }
 
-        // DONE이면 자동 OFF
-        if (st == BallTrackingState::DONE) {
-            CheckDlgButton(IDC_CHK_TRACK, BST_UNCHECKED);
-            SetLedOn(FALSE);
-            StopTracking();
-            SetDlgItemText(IDC_STATIC_SYSTEM_STATUS, _T("추적 완료 - 궤적 저장됨"));
-        }
+        // 오버레이된 영상 출력 - 더블 버퍼링 사용
+        ShowMatToStatic(disp, m_imageCtrl);
 
-        // 5) FPS/밝기 표기
+        // FPS/밝기 표기
         m_fps = GetCurrentFps();
         m_brightness = GetCurrentBrightness();
         CString strFps, strBright;
@@ -867,17 +804,6 @@ void CVisionTrackerUIDlg::SetLedOn(BOOL on)
     SetDlgItemText(IDC_STATIC_LED_STATUS, on ? _T("ON") : _T("OFF"));
 }
 
-// EXE 디렉토리 가져오기
-static CString GetExeDirectory()
-{
-    TCHAR exePath[MAX_PATH] = { 0 };
-    GetModuleFileName(nullptr, exePath, MAX_PATH);
-    CString dir(exePath);
-    int slash = dir.ReverseFind(_T('\\'));
-    if (slash > 0) dir = dir.Left(slash);
-    return dir;
-}
-
 void CVisionTrackerUIDlg::OnClickedChkTrack()
 {
     const BOOL wantOn = (IsDlgButtonChecked(IDC_CHK_TRACK) == BST_CHECKED);
@@ -886,53 +812,11 @@ void CVisionTrackerUIDlg::OnClickedChkTrack()
     SetLedOn(wantOn);
 
     if (wantOn) {
-        // 현재 작업 디렉토리에 TrajectoryData 폴더 생성
-        TCHAR currentDir[MAX_PATH];
-        GetCurrentDirectory(MAX_PATH, currentDir);
-
-        CString dataFolder = CString(currentDir) + _T("\\TrajectoryData");
-        CreateDirectory(dataFolder, NULL);
-
-        // 오늘 날짜로 서브폴더 생성
-        CTime now = CTime::GetCurrentTime();
-        CString dateFolder;
-        dateFolder.Format(_T("%s\\%04d%02d%02d"),
-            dataFolder,
-            now.GetYear(),
-            now.GetMonth(),
-            now.GetDay());
-        CreateDirectory(dateFolder, NULL);
-
-        // CSV 파일명 생성 (밀리초는 GetTickCount 사용)
-        DWORD tick = GetTickCount() % 1000;  // 밀리초 부분만 추출
-        CString filename;
-        filename.Format(_T("trajectory_start_%04d%02d%02d_%02d%02d%02d_%03d.csv"),
-            now.GetYear(),
-            now.GetMonth(),
-            now.GetDay(),
-            now.GetHour(),
-            now.GetMinute(),
-            now.GetSecond(),
-            tick);
-
-        CString fullPath = dateFolder + _T("\\") + filename;
-
-        // ANSI 문자열로 변환
-        CT2A pathAnsi(fullPath);
-        SetTrajectoryCsvPath(pathAnsi.m_psz);
-
-        // 사용자에게 경로 알림
-        CString msg;
-        msg.Format(_T("궤적 저장 중: TrajectoryData\\%04d%02d%02d"),
-            now.GetYear(),
-            now.GetMonth(),
-            now.GetDay());
-        SetDlgItemText(IDC_STATIC_SYSTEM_STATUS, msg);
-
-        StartTracking();   // FIND 전환 + 즉시 1회 감지 시도
+        StartTracking();
+        SetDlgItemText(IDC_STATIC_SYSTEM_STATUS, _T("추적 활성화"));
     }
     else {
-        StopTracking();    // 게이트 OFF + CSV 닫기 + 상태 IDLE
-        SetDlgItemText(IDC_STATIC_SYSTEM_STATUS, _T("추적 중지됨"));
+        StopTracking();
+        SetDlgItemText(IDC_STATIC_SYSTEM_STATUS, _T("추적 비활성화"));
     }
 }

@@ -1,16 +1,4 @@
 #include "pch.h"
-//#include <thread>
-//#include <chrono>
-//#include <mutex>
-//#include <atomic>
-//#include <string>
-//#include <fstream>
-//#include <vector>
-//#include <regex>
-//#include <sstream>
-//#include <algorithm>
-//#include <Windows.h> 
-//#include <opencv2/opencv.hpp>
 #include "IVisionTracker.h"
 
 #ifdef min
@@ -60,25 +48,8 @@ namespace {
     int g_frameCount = 0;
     double g_lastFps = 0.0;
 
-    // 카메라 '실제' 프레임 인덱스(콜백 수신 시 1씩 증가)
-    static std::atomic<int> g_camFrameIndex{ 0 };
-
     // 볼 탐색 활성화 여부
     std::atomic<bool> g_trackingActive(false);
-
-    // 이번 세션에서 MOVE에 진입한 적이 있는지
-    static bool g_hadMoveInSession = false;
-
-    // CSV 로깅
-    std::string g_trajCsvPath;
-    std::ofstream g_trajCsv;
-    std::mutex g_csvMutex;
-    bool g_trajCsvEnabled = false;
-
-    const float kOutlierMaxStep = 100.0f; // 한 프레임에서 허용할 최대 이동량(px)
-
-    bool g_moveTagged = false;      // READY→MOVE로 '처음' 전환했는지 여부
-    std::string g_moveTimeTag;      // 파일명에 넣을 시각 태그
 
     // ROI 처리
     cv::Rect g_roiRect;
@@ -98,9 +69,11 @@ namespace {
     // 에러 메시지 전달용
     std::string g_lastError = "";
 
-    // 정지 판정용 변수
-    static cv::Point2f g_stillStartCenter = cv::Point2f(0, 0);
-    static int g_stillStartFrame = -1;
+    // 현재 감지된 공 정보
+    cv::Point2f g_currentBallCenter(-1, -1);
+    float g_currentBallRadius = 0.0f;
+    bool g_currentBallFound = false;
+    std::mutex g_ballInfoMutex;
 
     // IP 변환 헬퍼 함수
     std::string ConvertIp(uint32_t ip) {
@@ -112,47 +85,7 @@ namespace {
             ip & 0xff);
         return std::string(buf);
     }
-
-    // DLL 모듈 디렉토리 가져오기
-    static std::string GetThisModuleDirA() {
-        HMODULE hm = nullptr;
-        if (GetModuleHandleExA(
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            reinterpret_cast<LPCSTR>(&GetThisModuleDirA),
-            &hm)) {
-            char path[MAX_PATH] = {};
-            GetModuleFileNameA(hm, path, MAX_PATH);
-            std::string full(path);
-            size_t pos = full.find_last_of("\\/");
-            return (pos == std::string::npos) ? full : full.substr(0, pos);
-        }
-        return std::string(".");
-    }
-
-    // 로컬 시간 태그 생성
-    static std::string NowTagLocal() {
-        SYSTEMTIME st;
-        GetLocalTime(&st);
-        char buf[64];
-        sprintf_s(buf, "%04d%02d%02d_%02d%02d%02d_%03d",
-            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-        return std::string(buf);
-    }
-
-    // 파일 경로에서 디렉토리명 추출
-    static std::string PathDirname(const std::string& p) {
-        size_t pos = p.find_last_of("\\/");
-        return (pos == std::string::npos) ? std::string(".") : p.substr(0, pos);
-    }
 }
-
-// 전역 상태 변수
-BallTrackingState g_trackingState = BallTrackingState::IDLE;
-std::vector<BallTrajectoryEntry> g_ballTrajectory;
-int g_trackingFrameCount = 0;
-bool g_enableTrackingByDistance = true;
-cv::Point2f g_lastKnownPosition = cv::Point2f(0, 0);
 
 // 이미지 수신 콜백 함수
 extern "C" void __stdcall ImageCallback(unsigned char* pData, MV_FRAME_OUT_INFO_EX* pInfo, void* pUser)
@@ -191,7 +124,6 @@ extern "C" void __stdcall ImageCallback(unsigned char* pData, MV_FRAME_OUT_INFO_
             uint64_t timestampRaw = (static_cast<uint64_t>(pInfo->nDevTimeStampHigh) << 32) | pInfo->nDevTimeStampLow;
             g_lastTimestamp = timestampRaw / 1e9;  // 초 단위 변환
         }
-        g_camFrameIndex++;
     }
 
     // FPS 계산
@@ -204,314 +136,21 @@ extern "C" void __stdcall ImageCallback(unsigned char* pData, MV_FRAME_OUT_INFO_
         g_lastTime = now;
     }
 
+    // 볼 감지가 활성화된 경우 현재 프레임에서 공 찾기
     if (g_trackingActive) {
         int tmpX = 0, tmpY = 0, tmpR = 0, tmpPts = 0;
-        GetWhiteBallInfo(&tmpX, &tmpY, &tmpR, &tmpPts);
-        // 결과는 UpdateBallTrackingState()를 통해 궤적/상태 전역에 반영되어 있음
-    }
-}
+        bool found = GetWhiteBallInfo(&tmpX, &tmpY, &tmpR, &tmpPts);
 
-// 상태 문자열 변환 함수
-static const char* StateToCStr(BallTrackingState s) {
-    switch (s) {
-    case BallTrackingState::READY: return "READY";
-    case BallTrackingState::MOVE:  return "MOVE";
-    case BallTrackingState::DONE:  return "DONE";
-    case BallTrackingState::FIND:  return "FIND";
-    default: return "IDLE";
-    }
-}
-
-// 공 추적 상태 업데이트 함수
-void UpdateBallTrackingState(const cv::Point2f& center, float radius, bool ballFound)
-{
-    static int lostCount = 0;
-    static int stillCount = 0;
-
-    static const int   kStillFramesThreshold = 60;
-    static const float kStillEpsPixels = 1.5f;
-
-    switch (g_trackingState)
-    {
-    case BallTrackingState::IDLE:
-        return;
-
-    case BallTrackingState::FIND:
-        if (ballFound) {
-            lostCount = 0;
-            stillCount = 0;
-            if (!g_ballTrajectory.empty()) {
-                g_ballTrajectory.clear();
-                g_trackingFrameCount = 0;
-            }
-
-            g_trackingState = BallTrackingState::READY;
-            g_lastKnownPosition = center;
-
-            g_ballTrajectory.push_back({ g_camFrameIndex.load(), center, radius, BallTrackingState::READY });
-
-            // CSV 기록 - flush 추가
-            if (g_trajCsvEnabled) {
-                std::lock_guard<std::mutex> lk(g_csvMutex);
-                if (g_trajCsv.is_open()) {
-                    g_trajCsv << g_camFrameIndex << ",READY"
-                        << "," << std::fixed << std::setprecision(2)
-                        << center.x << "," << center.y << "," << radius << "\n";
-                    g_trajCsv.flush();  // 즉시 파일에 쓰기
-                }
-            }
-        }
-        break;
-
-    case BallTrackingState::READY:
-    {
-        if (!ballFound) {
-            lostCount++;
-            if (!g_hadMoveInSession && lostCount > 5) {
-                g_trackingState = BallTrackingState::FIND;
-                lostCount = 0;
-                stillCount = 0;
-            }
-            else if (lostCount > 5) {
-                g_ballTrajectory.push_back({ g_camFrameIndex.load(), cv::Point2f(-1, -1), 0.0f, BallTrackingState::DONE });
-                if (g_trajCsvEnabled) {
-                    std::lock_guard<std::mutex> lk(g_csvMutex);
-                    if (g_trajCsv.is_open()) {
-                        g_trajCsv << g_camFrameIndex << ",DONE,-1,-1,0\n";
-                        g_trajCsv.flush();
-                    }
-                }
-                g_trackingState = BallTrackingState::DONE;
-            }
+        std::lock_guard<std::mutex> lock(g_ballInfoMutex);
+        if (found) {
+            g_currentBallCenter = cv::Point2f((float)tmpX, (float)tmpY);
+            g_currentBallRadius = (float)tmpR;
+            g_currentBallFound = true;
         }
         else {
-            lostCount = 0;
-            float dist = static_cast<float>(cv::norm(center - g_lastKnownPosition));
-
-            if (dist > 2.2f) {
-                cv::Point2f refPt = g_lastKnownPosition;
-                for (int i = static_cast<int>(g_ballTrajectory.size()) - 1; i >= 0; --i) {
-                    const auto& e = g_ballTrajectory[i];
-                    if (e.center.x >= 0 && e.center.y >= 0) {
-                        refPt = e.center;
-                        break;
-                    }
-                }
-                float distRef = static_cast<float>(cv::norm(center - refPt));
-
-                if (distRef >= kOutlierMaxStep) {
-                    lostCount++;
-                    stillCount = 0;
-                }
-                else {
-                    g_trackingState = BallTrackingState::MOVE;
-                    g_hadMoveInSession = true;
-                    stillCount = 0;
-
-                    // MOVE 시점에 CSV 파일명 변경
-                    if (!g_moveTagged && g_trajCsvEnabled) {
-                        std::lock_guard<std::mutex> lk(g_csvMutex);
-
-                        if (g_trajCsv.is_open()) {
-                            g_trajCsv.close();
-                        }
-
-                        g_moveTimeTag = NowTagLocal();
-                        g_moveTagged = true;
-
-                        // 같은 폴더 내에서 파일명만 변경
-                        std::string oldPath = g_trajCsvPath;
-                        size_t lastSlash = oldPath.find_last_of("\\/");
-                        std::string folder = (lastSlash != std::string::npos) ?
-                            oldPath.substr(0, lastSlash) : ".";
-
-                        std::string finalPath = folder + "\\trajectory_MOVE_" + g_moveTimeTag + ".csv";
-
-                        // 파일 이동
-                        if (!MoveFileExA(oldPath.c_str(), finalPath.c_str(), MOVEFILE_REPLACE_EXISTING)) {
-                            printf("CSV 파일 이름 변경 실패: %s -> %s\n", oldPath.c_str(), finalPath.c_str());
-                            finalPath = oldPath;  // 실패 시 원래 경로 유지
-                        }
-
-                        g_trajCsvPath = finalPath;
-                        g_trajCsv.open(g_trajCsvPath, std::ios::out | std::ios::app);
-                        g_trajCsvEnabled = g_trajCsv.is_open();
-                    }
-
-                    g_ballTrajectory.push_back({ g_camFrameIndex.load(), center, radius, BallTrackingState::MOVE });
-                    if (g_trajCsvEnabled) {
-                        std::lock_guard<std::mutex> lk(g_csvMutex);
-                        if (g_trajCsv.is_open()) {
-                            g_trajCsv << g_camFrameIndex << ",MOVE,"
-                                << std::fixed << std::setprecision(2)
-                                << center.x << "," << center.y << "," << radius << "\n";
-                            g_trajCsv.flush();
-                        }
-                    }
-                    g_lastKnownPosition = center;
-                }
-            }
-            else {
-                g_ballTrajectory.push_back({ g_camFrameIndex.load(), center, radius, BallTrackingState::READY });
-                if (g_trajCsvEnabled) {
-                    std::lock_guard<std::mutex> lk(g_csvMutex);
-                    if (g_trajCsv.is_open()) {
-                        g_trajCsv << g_camFrameIndex << ",READY"
-                            << "," << std::fixed << std::setprecision(2)
-                            << center.x << "," << center.y << "," << radius << "\n";
-                        g_trajCsv.flush();
-                    }
-                }
-            }
+            g_currentBallFound = false;
         }
     }
-    break;
-
-    case BallTrackingState::MOVE:
-    {
-        if (ballFound) {
-            cv::Point2f refPt = g_lastKnownPosition;
-            for (int i = (int)g_ballTrajectory.size() - 1; i >= 0; --i) {
-                const auto& e = g_ballTrajectory[i];
-                if (e.center.x >= 0 && e.center.y >= 0) {
-                    refPt = e.center;
-                    break;
-                }
-            }
-
-            float dist = static_cast<float>(cv::norm(center - refPt));
-            const bool isOutlier = (dist >= kOutlierMaxStep);
-
-            if (!isOutlier) {
-                if (dist <= kStillEpsPixels) {
-                    if (stillCount == 0) {
-                        g_stillStartCenter = center;
-                        g_stillStartFrame = g_camFrameIndex;
-                    }
-                    stillCount++;
-                }
-                else {
-                    stillCount = 0;
-                }
-
-                if (stillCount >= kStillFramesThreshold) {
-                    const int   kDriftWindowFrames = 20;
-                    const float kDriftCancelThresh = kStillEpsPixels * 3.0f;
-                    const int   kForceDoneExtra = 24;
-
-                    bool cancelDoneByDrift = false;
-
-                    if (g_stillStartFrame >= 0 && (g_camFrameIndex - g_stillStartFrame) >= kDriftWindowFrames) {
-                        float driftFromStart = static_cast<float>(cv::norm(center - g_stillStartCenter));
-                        if (driftFromStart > kDriftCancelThresh) {
-                            cancelDoneByDrift = true;
-                        }
-                    }
-
-                    bool forceDone = (stillCount >= (kStillFramesThreshold + kForceDoneExtra));
-
-                    if (cancelDoneByDrift && !forceDone) {
-                        stillCount = 0;
-                        g_stillStartFrame = -1;
-
-                        g_ballTrajectory.push_back({ g_camFrameIndex.load(), center, radius, BallTrackingState::MOVE });
-                        g_lastKnownPosition = center;
-                        lostCount = 0;
-
-                        if (g_trajCsvEnabled) {
-                            std::lock_guard<std::mutex> lk(g_csvMutex);
-                            if (g_trajCsv.is_open()) {
-                                g_trajCsv << g_camFrameIndex << ",MOVE,"
-                                    << std::fixed << std::setprecision(2)
-                                    << center.x << "," << center.y << "," << radius << "\n";
-                                g_trajCsv.flush();
-                            }
-                        }
-                    }
-                    else {
-                        g_ballTrajectory.push_back({ g_camFrameIndex.load(), cv::Point2f(-1, -1), 0.0f, BallTrackingState::DONE });
-                        if (g_trajCsvEnabled) {
-                            std::lock_guard<std::mutex> lk(g_csvMutex);
-                            if (g_trajCsv.is_open()) {
-                                g_trajCsv << g_camFrameIndex << ",DONE,-1,-1,0\n";
-                                g_trajCsv.flush();
-                            }
-                        }
-                        g_trackingState = BallTrackingState::DONE;
-                    }
-                }
-                else {
-                    g_ballTrajectory.push_back({ g_camFrameIndex.load(), center, radius, BallTrackingState::MOVE });
-                    g_lastKnownPosition = center;
-                    lostCount = 0;
-
-                    if (g_trajCsvEnabled) {
-                        std::lock_guard<std::mutex> lk(g_csvMutex);
-                        if (g_trajCsv.is_open()) {
-                            g_trajCsv << g_camFrameIndex << ",MOVE,"
-                                << std::fixed << std::setprecision(2)
-                                << center.x << "," << center.y << "," << radius << "\n";
-                            g_trajCsv.flush();
-                        }
-                    }
-                }
-            }
-            else {
-                lostCount++;
-                stillCount = 0;
-
-                if (lostCount >= 15) {
-                    g_ballTrajectory.push_back({ g_camFrameIndex.load(), cv::Point2f(-1, -1), 0.0f, BallTrackingState::DONE });
-                    if (g_trajCsvEnabled) {
-                        std::lock_guard<std::mutex> lk(g_csvMutex);
-                        if (g_trajCsv.is_open()) {
-                            g_trajCsv << g_camFrameIndex << ",DONE,-1,-1,0\n";
-                            g_trajCsv.flush();
-                        }
-                    }
-                    g_trackingState = BallTrackingState::DONE;
-                }
-            }
-        }
-        else {
-            lostCount++;
-            stillCount = 0;
-
-            if (lostCount >= 15) {
-                g_ballTrajectory.push_back({ g_camFrameIndex.load(), cv::Point2f(-1, -1), 0.0f, BallTrackingState::DONE });
-                if (g_trajCsvEnabled) {
-                    std::lock_guard<std::mutex> lk(g_csvMutex);
-                    if (g_trajCsv.is_open()) {
-                        g_trajCsv << g_camFrameIndex << ",DONE,-1,-1,0\n";
-                        g_trajCsv.flush();
-                    }
-                }
-                g_trackingState = BallTrackingState::DONE;
-            }
-        }
-    }
-    break;
-
-    case BallTrackingState::DONE:
-    {
-        if (g_trajCsvEnabled) {
-            std::lock_guard<std::mutex> lk(g_csvMutex);
-            if (g_trajCsv.is_open()) {
-                g_trajCsv.close();
-                printf("CSV 파일 저장 완료: %s\n", g_trajCsvPath.c_str());
-            }
-            g_trajCsvEnabled = false;
-        }
-
-        g_moveTagged = false;
-        g_moveTimeTag.clear();
-        lostCount = 0;
-        stillCount = 0;
-    }
-    break;
-    }
-
-    g_trackingFrameCount++;
 }
 
 // API 구현부
@@ -697,56 +336,6 @@ extern "C" VISIONTRACKER_API bool IsNodeSupported(const char* nodeName)
     return (nRet == MV_OK);
 }
 
-// 기존 InitCamera - deprecated
-extern "C" VISIONTRACKER_API bool InitCamera()
-{
-    printf("Warning: InitCamera() is deprecated. Use EnumerateCameras() and ConnectCameraByIndex() instead.\n");
-    g_lastError.clear();
-
-    // 카메라 열거
-    MV_CC_DEVICE_INFO_LIST stDeviceList;
-    memset(&stDeviceList, 0, sizeof(MV_CC_DEVICE_INFO_LIST));
-
-    int nRet = MV_CC_EnumDevices(MV_GIGE_DEVICE | MV_USB_DEVICE, &stDeviceList);
-    if (nRet != MV_OK || stDeviceList.nDeviceNum == 0) {
-        g_lastError = "디바이스 나열 실패 또는 장치 없음.";
-        return false;
-    }
-
-    MV_CC_DEVICE_INFO* pDeviceInfo = nullptr;
-
-    if (!g_selectedIp.empty()) {
-        for (unsigned int i = 0; i < stDeviceList.nDeviceNum; ++i) {
-            MV_CC_DEVICE_INFO* pInfo = stDeviceList.pDeviceInfo[i];
-            if (pInfo->nTLayerType == MV_GIGE_DEVICE) {
-                const MV_GIGE_DEVICE_INFO& info = pInfo->SpecialInfo.stGigEInfo;
-                std::string deviceIp = ConvertIp(info.nCurrentIp);
-                if (g_selectedIp == deviceIp) {
-                    pDeviceInfo = pInfo;
-                    break;
-                }
-            }
-        }
-    }
-    else {
-        pDeviceInfo = stDeviceList.pDeviceInfo[0];
-    }
-
-    if (!pDeviceInfo) {
-        g_lastError = "일치하는 디바이스 정보를 찾지 못했습니다.";
-        return false;
-    }
-
-    // 이하 기존 코드와 동일...
-    return ConnectCameraByIndex(0);
-}
-
-extern "C" VISIONTRACKER_API void CloseCamera()
-{
-    DisconnectCamera();
-}
-
-// 이하 모든 함수들은 기존과 동일
 extern "C" VISIONTRACKER_API bool SetTriggerMode(bool enable)
 {
     if (!g_handle) {
@@ -797,7 +386,6 @@ extern "C" VISIONTRACKER_API bool SetTriggerMode(bool enable)
     return true;
 }
 
-// 나머지 모든 함수들 (StartGrab, StopGrab, 등등)은 기존과 완전히 동일
 extern "C" VISIONTRACKER_API void StartGrab()
 {
     if (!g_handle) return;
@@ -953,10 +541,11 @@ extern "C" VISIONTRACKER_API bool SetROI(int x, int y, int width, int height)
 
 extern "C" VISIONTRACKER_API bool GetWhiteBallInfo(int* centerX, int* centerY, int* radius, int* pointCount)
 {
-    if (!g_trackingActive) return false;
+    if (!centerX || !centerY || !radius || !pointCount)
+        return false;
 
     std::lock_guard<std::mutex> lock(g_frameMutex);
-    if (g_latestFrame.empty() || !centerX || !centerY || !radius || !pointCount)
+    if (g_latestFrame.empty())
         return false;
 
     cv::Mat gray, bin;
@@ -1002,15 +591,12 @@ extern "C" VISIONTRACKER_API bool GetWhiteBallInfo(int* centerX, int* centerY, i
     const float maxRadius = g_whiteBallConfig.maxRadius;
     const float minCircularity = g_whiteBallConfig.minCircularity;
     const float maxCircularity = g_whiteBallConfig.maxCircularity;
-    const bool useTracking = g_whiteBallConfig.useTracking;
 
     int bestIdx = -1;
-    float bestDistance = FLT_MAX;
+    float bestCircularity = 0;
     cv::Point2f bestCenter;
     float bestRadius = 0;
     int bestPoints = 0;
-
-    static cv::Point2f prevCenter(-1, -1);
 
     for (size_t i = 0; i < contours.size(); ++i)
     {
@@ -1030,32 +616,21 @@ extern "C" VISIONTRACKER_API bool GetWhiteBallInfo(int* centerX, int* centerY, i
         if (circularity < minCircularity || circularity > maxCircularity)
             continue;
 
+        // ROI 좌표를 원본 이미지 좌표로 변환
         center.x += roiRect.x;
         center.y += roiRect.y;
 
-        float distance = static_cast<float>(useTracking && prevCenter.x >= 0 ? cv::norm(center - prevCenter) : 0);
-
-        if (useTracking) {
-            if (distance < bestDistance) {
-                bestIdx = (int)i;
-                bestDistance = distance;
-                bestCenter = center;
-                bestRadius = radius;
-                bestPoints = (int)contours[i].size();
-            }
-        }
-        else {
-            if ((int)contours[i].size() > bestPoints) {
-                bestIdx = (int)i;
-                bestCenter = center;
-                bestRadius = radius;
-                bestPoints = (int)contours[i].size();
-            }
+        // 가장 원형에 가까운 것을 선택
+        if (circularity > bestCircularity) {
+            bestIdx = (int)i;
+            bestCircularity = (float)circularity;
+            bestCenter = center;
+            bestRadius = radius;
+            bestPoints = (int)contours[i].size();
         }
     }
 
     if (bestIdx == -1) {
-        UpdateBallTrackingState(cv::Point2f(), 0.0f, false);
         return false;
     }
 
@@ -1063,16 +638,6 @@ extern "C" VISIONTRACKER_API bool GetWhiteBallInfo(int* centerX, int* centerY, i
     *centerY = static_cast<int>(bestCenter.y);
     *radius = static_cast<int>(bestRadius);
     *pointCount = bestPoints;
-
-    prevCenter = bestCenter;
-
-    if (centerX && centerY && radius && pointCount && *pointCount > 0) {
-        cv::Point2f pt((float)*centerX, (float)*centerY);
-        UpdateBallTrackingState(pt, (float)*radius, true);
-    }
-    else {
-        UpdateBallTrackingState(cv::Point2f(), 0.0f, false);
-    }
 
     return true;
 }
@@ -1087,49 +652,6 @@ extern "C" VISIONTRACKER_API WhiteBallDetectionConfig GetWhiteBallDetectionConfi
 {
     std::lock_guard<std::mutex> lock(g_frameMutex);
     return g_whiteBallConfig;
-}
-
-extern "C" VISIONTRACKER_API void SetBallTrackingStateFind()
-{
-    g_trackingState = BallTrackingState::FIND;
-    g_ballTrajectory.clear();
-    g_trackingFrameCount = 0;
-    g_lastKnownPosition = cv::Point2f(0, 0);
-}
-
-extern "C" VISIONTRACKER_API BallTrackingState GetBallTrackingState()
-{
-    return g_trackingState;
-}
-
-extern "C" VISIONTRACKER_API int GetBallTrajectoryCount()
-{
-    return (int)g_ballTrajectory.size();
-}
-
-extern "C" VISIONTRACKER_API bool GetBallTrajectoryAt(int index, float* x, float* y, float* r, int* frame)
-{
-    if (index < 0 || index >= (int)g_ballTrajectory.size())
-        return false;
-    const auto& entry = g_ballTrajectory[index];
-    *x = entry.center.x;
-    *y = entry.center.y;
-    *r = entry.radius;
-    *frame = entry.frameIndex;
-    return true;
-}
-
-extern "C" VISIONTRACKER_API bool GetBallTrajectoryAtEx(int index, float* x, float* y, float* r, int* frame, int* state)
-{
-    if (index < 0 || index >= (int)g_ballTrajectory.size())
-        return false;
-    const auto& e = g_ballTrajectory[index];
-    if (x) *x = e.center.x;
-    if (y) *y = e.center.y;
-    if (r) *r = e.radius;
-    if (frame) *frame = e.frameIndex;
-    if (state) *state = static_cast<int>(e.state);
-    return true;
 }
 
 extern "C" VISIONTRACKER_API bool SetGain(float gain)
@@ -1209,75 +731,16 @@ extern "C" VISIONTRACKER_API bool SelectCameraFromFile(const char* filepath)
 extern "C" VISIONTRACKER_API void StartTracking()
 {
     g_trackingActive = true;
-    g_hadMoveInSession = false;
-
-    SetBallTrackingStateFind();
-
-    {
-        std::lock_guard<std::mutex> lk(g_csvMutex);
-
-        if (g_trajCsv.is_open()) {
-            g_trajCsv.close();
-        }
-
-        if (g_trajCsvPath.empty()) {
-            char currentDir[MAX_PATH];
-            GetCurrentDirectoryA(MAX_PATH, currentDir);
-            std::string baseDir(currentDir);
-
-            std::string dataFolder = baseDir + "\\TrajectoryData";
-            CreateDirectoryA(dataFolder.c_str(), NULL);
-
-            SYSTEMTIME st;
-            GetLocalTime(&st);
-            char dateFolder[64];
-            sprintf_s(dateFolder, "%04d%02d%02d", st.wYear, st.wMonth, st.wDay);
-            std::string fullFolder = dataFolder + "\\" + dateFolder;
-            CreateDirectoryA(fullFolder.c_str(), NULL);
-
-            std::string tag = NowTagLocal();
-            g_trajCsvPath = fullFolder + "\\trajectory_start_" + tag + ".csv";
-
-            printf("CSV 저장 폴더: %s\n", fullFolder.c_str());
-        }
-
-        g_moveTagged = false;
-        g_moveTimeTag.clear();
-
-        g_trajCsv.open(g_trajCsvPath, std::ios::out | std::ios::trunc);
-        if (g_trajCsv.is_open()) {
-            g_trajCsv << "frame,state,x,y,radius\n";
-            g_trajCsv.flush();
-            g_trajCsvEnabled = true;
-            printf("CSV 파일 생성: %s\n", g_trajCsvPath.c_str());
-        }
-        else {
-            g_trajCsvEnabled = false;
-            printf("CSV 파일 생성 실패: %s\n", g_trajCsvPath.c_str());
-        }
-    }
-
-    int x = 0, y = 0, r = 0, pts = 0;
-    GetWhiteBallInfo(&x, &y, &r, &pts);
 }
 
 extern "C" VISIONTRACKER_API void StopTracking()
 {
     g_trackingActive = false;
 
-    {
-        std::lock_guard<std::mutex> lk(g_csvMutex);
-        if (g_trajCsv.is_open()) {
-            g_trajCsv.flush();
-            g_trajCsv.close();
-            printf("추적 중지 - CSV 파일 닫기: %s\n", g_trajCsvPath.c_str());
-        }
-        g_trajCsvEnabled = false;
-    }
-
-    g_trackingState = BallTrackingState::IDLE;
-    g_moveTagged = false;
-    g_moveTimeTag.clear();
+    std::lock_guard<std::mutex> lock(g_ballInfoMutex);
+    g_currentBallFound = false;
+    g_currentBallCenter = cv::Point2f(-1, -1);
+    g_currentBallRadius = 0.0f;
 }
 
 extern "C" VISIONTRACKER_API bool IsTrackingActive()
@@ -1285,13 +748,34 @@ extern "C" VISIONTRACKER_API bool IsTrackingActive()
     return g_trackingActive.load();
 }
 
-extern "C" VISIONTRACKER_API void SetTrajectoryCsvPath(const char* path)
+extern "C" VISIONTRACKER_API void GetCurrentBallPosition(float* x, float* y, float* radius, bool* found)
 {
-    std::lock_guard<std::mutex> lk(g_csvMutex);
-    g_trajCsvPath = (path ? path : "");
+    std::lock_guard<std::mutex> lock(g_ballInfoMutex);
+    if (x) *x = g_currentBallCenter.x;
+    if (y) *y = g_currentBallCenter.y;
+    if (radius) *radius = g_currentBallRadius;
+    if (found) *found = g_currentBallFound;
 }
 
-extern "C" VISIONTRACKER_API const char* GetCurrentCsvPath()
+// 기존 InitCamera - deprecated
+extern "C" VISIONTRACKER_API bool InitCamera()
 {
-    return g_trajCsvPath.c_str();
+    printf("Warning: InitCamera() is deprecated. Use EnumerateCameras() and ConnectCameraByIndex() instead.\n");
+    g_lastError.clear();
+
+    MV_CC_DEVICE_INFO_LIST stDeviceList;
+    memset(&stDeviceList, 0, sizeof(MV_CC_DEVICE_INFO_LIST));
+
+    int nRet = MV_CC_EnumDevices(MV_GIGE_DEVICE | MV_USB_DEVICE, &stDeviceList);
+    if (nRet != MV_OK || stDeviceList.nDeviceNum == 0) {
+        g_lastError = "디바이스 나열 실패 또는 장치 없음.";
+        return false;
+    }
+
+    return ConnectCameraByIndex(0);
+}
+
+extern "C" VISIONTRACKER_API void CloseCamera()
+{
+    DisconnectCamera();
 }

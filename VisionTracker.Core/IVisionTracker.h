@@ -43,25 +43,6 @@ struct WhiteBallDetectionConfig
     bool useTracking;            // 이전 프레임 기반 거리 추적 여부
 };
 
-// 공 추적 상태 열거형
-enum class BallTrackingState
-{
-    IDLE,       // 기본 상태 (아무것도 하지 않음)
-    FIND,       // 탐색 중
-    READY,      // 레디 판단
-    MOVE,       // 공이 이동 중
-    DONE        // 공 추적 완료
-};
-
-// 공 궤적 엔트리 구조체
-struct BallTrajectoryEntry
-{
-    int frameIndex;              // 프레임 번호
-    cv::Point2f center;          // 중심 좌표
-    float radius;                // 반지름
-    BallTrackingState state;     // READY, MOVE, DONE
-};
-
 // 카메라 정보 구조체
 struct CameraInfo {
     char displayName[256];
@@ -73,11 +54,6 @@ struct CameraInfo {
 
 // 전역 설정 외부 참조
 extern WhiteBallDetectionConfig g_whiteBallConfig;
-extern BallTrackingState g_trackingState;
-extern std::vector<BallTrajectoryEntry> g_ballTrajectory;
-extern int g_trackingFrameCount;
-extern bool g_enableTrackingByDistance;
-extern cv::Point2f g_lastKnownPosition;
 
 // C 스타일 인터페이스
 extern "C" {
@@ -138,26 +114,14 @@ extern "C" {
     VISIONTRACKER_API void SetWhiteBallDetectionConfig(const WhiteBallDetectionConfig& config);
     VISIONTRACKER_API WhiteBallDetectionConfig GetWhiteBallDetectionConfig();
 
-    // 공 추적 제어
-    VISIONTRACKER_API void SetBallTrackingStateFind();
-    VISIONTRACKER_API BallTrackingState GetBallTrackingState();
-    VISIONTRACKER_API int GetBallTrajectoryCount();
-    VISIONTRACKER_API bool GetBallTrajectoryAt(int index, float* x, float* y, float* r, int* frame);
-    VISIONTRACKER_API bool GetBallTrajectoryAtEx(int index, float* x, float* y, float* r,
-        int* frame, int* state);
-
     // 추적 제어
     VISIONTRACKER_API void StartTracking();
     VISIONTRACKER_API void StopTracking();
     VISIONTRACKER_API bool IsTrackingActive();
-    VISIONTRACKER_API void SetTrajectoryCsvPath(const char* path);
-    VISIONTRACKER_API const char* GetCurrentCsvPath();
+    VISIONTRACKER_API void GetCurrentBallPosition(float* x, float* y, float* radius, bool* found);
 
     // 카메라 선택
     VISIONTRACKER_API double GetLastTimestamp();
     VISIONTRACKER_API bool SelectCameraByIP(const char* ipAddress);
     VISIONTRACKER_API bool SelectCameraFromFile(const char* filepath);
 }
-
-// 내부 함수
-void UpdateBallTrackingState(const cv::Point2f& center, float radius, bool ballFound);

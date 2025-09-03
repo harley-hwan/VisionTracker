@@ -1,6 +1,3 @@
-// VisionTracker.UIDlg.h : 헤더 파일
-//
-
 #pragma once
 #include "afxwin.h"
 #include <opencv2/opencv.hpp>
