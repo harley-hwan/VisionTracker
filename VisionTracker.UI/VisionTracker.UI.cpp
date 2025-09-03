@@ -11,6 +11,35 @@
 #define new DEBUG_NEW
 #endif
 
+#include <io.h>
+#include <fcntl.h>
+#include <iostream>
+
+void CreateConsoleWindow()
+{
+	AllocConsole();
+
+	FILE* pCout;  FILE* pCerr;  FILE* pCin;
+	freopen_s(&pCout, "CONOUT$", "w", stdout);
+	freopen_s(&pCerr, "CONOUT$", "w", stderr);
+	freopen_s(&pCin, "CONIN$", "r", stdin);
+
+	std::ios::sync_with_stdio();
+
+	SetConsoleTitle(_T("VisionTracker Debug Console"));
+
+	HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+	CONSOLE_SCREEN_BUFFER_INFO csbi;
+	GetConsoleScreenBufferInfo(hConsole, &csbi);
+	COORD bufferSize;
+	bufferSize.X = 120;
+	bufferSize.Y = 3000;
+	SetConsoleScreenBufferSize(hConsole, bufferSize);
+
+	printf("=== VisionTracker Debug Console ===\n");
+	printf("Ball Tracking System v1.0\n");
+	printf("=====================================\n\n");
+}
 
 // CVisionTrackerUIApp
 
@@ -52,6 +81,7 @@ BOOL CVisionTrackerUIApp::InitInstance()
 
 	CWinApp::InitInstance();
 
+	CreateConsoleWindow();
 
 	AfxEnableControlContainer();
 
