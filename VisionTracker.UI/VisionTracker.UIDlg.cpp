@@ -109,6 +109,13 @@ BOOL CVisionTrackerUIDlg::OnInitDialog()
 {
     CDialogEx::OnInitDialog();
 
+    // 콘솔 창 할당
+    AllocateConsole("Vision Tracker Console");
+
+    // Logger 초기화 (0=Debug, 1=Info, 2=Warning, 3=Error, 4=Critical)
+    InitializeLogger("VisionTracker.log", 0, 50 * 1024 * 1024, 10);  // Debug 레벨, 50MB, 10개 파일
+    LogInfo("=== Vision Tracker UI Started ===");
+
     // 시스템 메뉴에 "정보..." 메뉴 항목을 추가합니다.
     ASSERT((IDM_ABOUTBOX & 0xFFF0) == IDM_ABOUTBOX);
     ASSERT(IDM_ABOUTBOX < 0xF000);
@@ -355,21 +362,25 @@ void CVisionTrackerUIDlg::OnBnClickedButtonConnectCamera()
         EnableCameraControls(TRUE);
 
         // 현재 설정값 읽기
-        //GetGain(&m_f_gain);
-        //GetBlackLevel(&m_i_blacklevel);
-        //GetFrameRate(&m_f_fps);
-        //GetExposureTime(&m_f_exposure);
-        //GetGamma(&m_f_gamma);
         UpdateData(FALSE);
 
         SetDlgItemText(IDC_STATIC_SYSTEM_STATUS, _T("카메라 연결 성공"));
 
-        // 연결된 카메라 정보 표시
+        // 연결된 카메라 정보 표시 및 로깅
         CameraInfo info;
         if (GetConnectedCameraInfo(&info)) {
             CString infoStr;
             infoStr.Format(_T("연결된 카메라: %s"), CString(info.modelName));
             SetDlgItemText(IDC_STATIC_SYSTEM_STATUS, infoStr);
+
+            // 로그에 기록
+            CString logMsg;
+            logMsg.Format(_T("Camera connected - Model: %s, Serial: %s"),
+                CString(info.modelName), CString(info.serialNumber));
+            if (info.deviceType == 0) {
+                logMsg.AppendFormat(_T(", IP: %s"), CString(info.ipAddress));
+            }
+            LogInfo(CT2A(logMsg));
         }
     }
     else {
@@ -377,6 +388,10 @@ void CVisionTrackerUIDlg::OnBnClickedButtonConnectCamera()
         CString fullMsg;
         fullMsg.Format(_T("카메라 연결 실패: %s"), errMsg);
         AfxMessageBox(fullMsg);
+
+        CString logMsg;
+        logMsg.Format(_T("Camera connection failed: %s"), errMsg);
+        LogError(CT2A(logMsg));
         SetDlgItemText(IDC_STATIC_SYSTEM_STATUS, _T("카메라 연결 실패"));
     }
     EndWaitCursor();
@@ -512,24 +527,31 @@ void CVisionTrackerUIDlg::OnBnClickedButton1()
     SetBlackLevel((int)blacklevel);
     SetROI(cropX, cropY, cropW, cropH);
 
-    // 볼 탐색 조건 설정
+    // 볼 탐색 조건 설정 - 수정된 부분
     {
         WhiteBallDetectionConfig config;
-        config.roi = cv::Rect(0, 0, 640, 480);        // 볼 탐색 영역 ROI 제한
-        config.thresholdMode = ThresholdMode::Fixed;   // Fixed, Adaptive, Otsu
+        // 볼 탐색 영역을 전체 이미지로 설정 (이미 crop된 이미지 내에서)
+        config.roi = cv::Rect(0, 0, 0, 0);  // 0,0,0,0은 전체 이미지를 의미
+        config.thresholdMode = ThresholdMode::Fixed;
         config.thresholdValue = 90;
-        config.thresholdType = cv::THRESH_BINARY;      // 0~4
+        config.thresholdType = cv::THRESH_BINARY;
         config.adaptiveMethod = AdaptiveMethod::Gaussian;
-        config.blockSize = 7;                          // 홀수 3 이상
-        config.C = 1.0;                                // 평균에서 빼는 값
+        config.blockSize = 7;
+        config.C = 1.0;
         config.minRadius = 2.5f;
         config.maxRadius = 10.0f;
         config.minCircularity = 0.8f;
         config.maxCircularity = 1.2f;
-        config.useTracking = false;  // 이전 프레임 추적 사용 안함
+        config.useTracking = false;
 
         SetWhiteBallDetectionConfig(config);
     }
+
+    // 로그에 기록
+    CString logMsg;
+    logMsg.Format(_T("Capture started - ROI: (%d, %d, %dx%d), FPS: %.1f, Exposure: %.1f"),
+        cropX, cropY, cropW, cropH, fps, exposure);
+    LogInfo(CT2A(logMsg));
 
     StartGrab();                    // DLL 프레임 수신 시작
     SetTimer(1, 33, nullptr);       // 약 33ms(30fps) 주기로 타이머 호출
@@ -538,11 +560,14 @@ void CVisionTrackerUIDlg::OnBnClickedButton1()
     SetDlgItemText(IDC_STATIC_SYSTEM_STATUS, _T("캡처 시작됨"));
 }
 
+
 void CVisionTrackerUIDlg::OnBnClickedButton2()
 {
     // 정지 버튼
     StopGrab();    // DLL 프레임 수신 중지
     KillTimer(1);  // 타이머 중지
+
+    LogInfo("Capture stopped");
 
     GetDlgItem(IDC_BUTTON2)->EnableWindow(FALSE);  // Stop 버튼 비활성화
     SetDlgItemText(IDC_STATIC_SYSTEM_STATUS, _T("캡처 중지됨"));
@@ -692,14 +717,14 @@ void CVisionTrackerUIDlg::OnTimer(UINT_PTR nIDEvent)
         // 프레임 정보 가져오기
         int w = 0, h = 0, ch = 0;
         if (!GetLatestFrameInfo(&w, &h, &ch)) {
-            OutputDebugString(_T("GetLatestFrameInfo 실패\n"));
+            LogError("GetLatestFrameInfo failed");
             CDialogEx::OnTimer(nIDEvent);
             return;
         }
 
         std::vector<unsigned char> buffer(w * h * ch);
         if (!GetLatestFrame(buffer.data(), (int)buffer.size(), &w, &h, &ch)) {
-            OutputDebugString(_T("GetLatestFrame 실패\n"));
+            LogError("GetLatestFrame failed");
             CDialogEx::OnTimer(nIDEvent);
             return;
         }
@@ -708,12 +733,10 @@ void CVisionTrackerUIDlg::OnTimer(UINT_PTR nIDEvent)
         cv::Mat img(h, w, (ch == 1 ? CV_8UC1 : CV_8UC3), buffer.data());
         cv::Mat disp;
         if (ch == 1) {
-            // 원본 그레이 → BGR 변환
             cv::cvtColor(img, disp, cv::COLOR_GRAY2BGR);
         }
         else {
-            // 3채널이면 그대로 사용
-            disp = img.clone(); // clone 추가
+            disp = img.clone();
         }
 
         // 추적이 활성화된 경우 공 위치 표시
@@ -740,7 +763,7 @@ void CVisionTrackerUIDlg::OnTimer(UINT_PTR nIDEvent)
             m_ballInfoCtrl.SetWindowText(_T("Tracking OFF"));
         }
 
-        // 오버레이된 영상 출력 - 더블 버퍼링 사용
+        // 오버레이된 영상 출력
         ShowMatToStatic(disp, m_imageCtrl);
 
         // FPS/밝기 표기
@@ -760,6 +783,8 @@ void CVisionTrackerUIDlg::OnDestroy()
 {
     CDialogEx::OnDestroy();
 
+    LogInfo("=== Vision Tracker UI Shutting Down ===");
+
     // 더블 버퍼링 리소스 정리
     if (m_memDC.GetSafeHdc()) {
         m_memDC.SelectObject(m_oldBitmap);
@@ -772,6 +797,13 @@ void CVisionTrackerUIDlg::OnDestroy()
         StopGrab();
         DisconnectCamera();
     }
+
+    // Logger 종료
+    FlushLogger();
+    ShutdownLogger();
+
+    // 콘솔 창 닫기
+    FreeConsoleWindow();
 }
 
 void CVisionTrackerUIDlg::OnOK()
@@ -814,9 +846,21 @@ void CVisionTrackerUIDlg::OnClickedChkTrack()
     if (wantOn) {
         StartTracking();
         SetDlgItemText(IDC_STATIC_SYSTEM_STATUS, _T("추적 활성화"));
+
+        LogInfo("===== Ball Tracking Started =====");
+
+        // 현재 설정 정보 로그
+        WhiteBallDetectionConfig config = GetWhiteBallDetectionConfig();
+        CString logMsg;
+        logMsg.Format(_T("Detection Config - ThresholdValue: %d, MinRadius: %.1f, MaxRadius: %.1f, Circularity: %.2f-%.2f"),
+            config.thresholdValue, config.minRadius, config.maxRadius,
+            config.minCircularity, config.maxCircularity);
+        LogInfo(CT2A(logMsg));
     }
     else {
         StopTracking();
         SetDlgItemText(IDC_STATIC_SYSTEM_STATUS, _T("추적 비활성화"));
+
+        LogInfo("===== Ball Tracking Stopped =====");
     }
 }

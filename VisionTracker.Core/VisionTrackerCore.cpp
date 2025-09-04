@@ -1,5 +1,9 @@
 #include "pch.h"
 #include "IVisionTracker.h"
+#include "Logger.h"
+#include <io.h>
+#include <fcntl.h>
+#include <iostream>
 
 #ifdef min
 #undef min
@@ -136,19 +140,34 @@ extern "C" void __stdcall ImageCallback(unsigned char* pData, MV_FRAME_OUT_INFO_
         g_lastTime = now;
     }
 
-    // 볼 감지가 활성화된 경우 현재 프레임에서 공 찾기
+    // 볼 감지가 활성화된 경우
     if (g_trackingActive) {
         int tmpX = 0, tmpY = 0, tmpR = 0, tmpPts = 0;
         bool found = GetWhiteBallInfo(&tmpX, &tmpY, &tmpR, &tmpPts);
+
+        // 프레임 카운터
+        static int frameCounter = 0;
+        frameCounter++;
 
         std::lock_guard<std::mutex> lock(g_ballInfoMutex);
         if (found) {
             g_currentBallCenter = cv::Point2f((float)tmpX, (float)tmpY);
             g_currentBallRadius = (float)tmpR;
             g_currentBallFound = true;
+
+            // 탐지 성공 로그
+            char logMsg[256];
+            sprintf_s(logMsg, "[Frame %06d] Ball FOUND - Position: (%.1f, %.1f), Radius: %.1f",
+                frameCounter, g_currentBallCenter.x, g_currentBallCenter.y, g_currentBallRadius);
+            LOG_INFO(std::string(logMsg));
         }
         else {
             g_currentBallFound = false;
+
+            // 탐지 실패 로그
+            char logMsg[256];
+            sprintf_s(logMsg, "[Frame %06d] Ball NOT FOUND", frameCounter);
+            LOG_DEBUG(std::string(logMsg));
         }
     }
 }
@@ -554,12 +573,29 @@ extern "C" VISIONTRACKER_API bool GetWhiteBallInfo(int* centerX, int* centerY, i
     else
         gray = g_latestFrame;
 
+    // 볼 검출용 ROI 설정 - 수정된 부분
     cv::Rect roiRect = g_whiteBallConfig.roi;
+
+    // ROI가 설정되지 않았거나 (0,0,0,0)이면 전체 이미지 사용
     if (roiRect.width == 0 || roiRect.height == 0) {
         roiRect = cv::Rect(0, 0, gray.cols, gray.rows);
     }
-    cv::Mat roi = gray(roiRect);
 
+    // ROI가 현재 이미지 범위를 벗어나는지 검사
+    if (roiRect.x < 0) roiRect.x = 0;
+    if (roiRect.y < 0) roiRect.y = 0;
+    if (roiRect.x + roiRect.width > gray.cols)
+        roiRect.width = gray.cols - roiRect.x;
+    if (roiRect.y + roiRect.height > gray.rows)
+        roiRect.height = gray.rows - roiRect.y;
+
+    // ROI가 유효한지 최종 확인
+    if (roiRect.width <= 0 || roiRect.height <= 0 ||
+        roiRect.x >= gray.cols || roiRect.y >= gray.rows) {
+        return false;
+    }
+
+    cv::Mat roi = gray(roiRect);
     cv::Mat work = roi.clone();
 
     switch (g_whiteBallConfig.thresholdMode)
@@ -778,4 +814,114 @@ extern "C" VISIONTRACKER_API bool InitCamera()
 extern "C" VISIONTRACKER_API void CloseCamera()
 {
     DisconnectCamera();
+}
+
+// ===== Logger 인터페이스 구현 =====
+extern "C" VISIONTRACKER_API bool InitializeLogger(const char* filePath, int logLevel, size_t maxFileSize, int maxBackupFiles)
+{
+    try {
+        Logger::GetInstance().Initialize(
+            filePath ? filePath : "VisionTracker.log",
+            static_cast<LogLevel>(logLevel),
+            maxFileSize,
+            maxBackupFiles
+        );
+
+        LOG_INFO("Logger initialized successfully");
+        return true;
+    }
+    catch (const std::exception& e) {
+        g_lastError = std::string("Logger initialization failed: ") + e.what();
+        return false;
+    }
+}
+
+extern "C" VISIONTRACKER_API void ShutdownLogger()
+{
+    Logger::GetInstance().Flush();
+    Logger::Destroy();
+}
+
+extern "C" VISIONTRACKER_API void SetLogLevel(int level)
+{
+    if (level >= 0 && level <= 4) {
+        Logger::GetInstance().SetLogLevel(static_cast<LogLevel>(level));
+    }
+}
+
+extern "C" VISIONTRACKER_API void LogDebug(const char* message)
+{
+    if (message) {
+        LOG_DEBUG(std::string(message));
+    }
+}
+
+extern "C" VISIONTRACKER_API void LogInfo(const char* message)
+{
+    if (message) {
+        LOG_INFO(std::string(message));
+    }
+}
+
+extern "C" VISIONTRACKER_API void LogWarning(const char* message)
+{
+    if (message) {
+        LOG_WARNING(std::string(message));
+    }
+}
+
+extern "C" VISIONTRACKER_API void LogError(const char* message)
+{
+    if (message) {
+        LOG_ERROR(std::string(message));
+    }
+}
+
+extern "C" VISIONTRACKER_API void LogCritical(const char* message)
+{
+    if (message) {
+        LOG_CRITICAL(std::string(message));
+    }
+}
+
+extern "C" VISIONTRACKER_API void FlushLogger()
+{
+    Logger::GetInstance().Flush();
+}
+
+extern "C" VISIONTRACKER_API bool AllocateConsole(const char* title)
+{
+    if (::AllocConsole()) {
+        // stdout, stderr를 콘솔로 리다이렉트
+        FILE* pCout;
+        freopen_s(&pCout, "CONOUT$", "w", stdout);
+        freopen_s(&pCout, "CONOUT$", "w", stderr);
+
+        // std::cout과 동기화
+        std::ios::sync_with_stdio();
+
+        // 콘솔 제목 설정
+        if (title) {
+            SetConsoleTitleA(title);
+        }
+        else {
+            SetConsoleTitleA("Vision Tracker Console");
+        }
+
+        // 콘솔 창 크기 조정
+        HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+        COORD bufferSize = { 120, 3000 };  // 버퍼 크기
+        SetConsoleScreenBufferSize(hConsole, bufferSize);
+
+        SMALL_RECT windowSize = { 0, 0, 119, 30 };  // 창 크기
+        SetConsoleWindowInfo(hConsole, TRUE, &windowSize);
+
+        return true;
+    }
+    return false;
+}
+
+extern "C" VISIONTRACKER_API void FreeConsoleWindow()
+{
+    ::FreeConsole();
 }

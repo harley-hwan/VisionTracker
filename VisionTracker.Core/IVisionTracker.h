@@ -124,4 +124,26 @@ extern "C" {
     VISIONTRACKER_API double GetLastTimestamp();
     VISIONTRACKER_API bool SelectCameraByIP(const char* ipAddress);
     VISIONTRACKER_API bool SelectCameraFromFile(const char* filepath);
+
+    // ===== Logger 인터페이스 =====
+    // Logger 초기화 및 종료
+    VISIONTRACKER_API bool InitializeLogger(const char* filePath, int logLevel, size_t maxFileSize, int maxBackupFiles);
+    VISIONTRACKER_API void ShutdownLogger();
+
+    // 로그 레벨 설정 (0=Debug, 1=Info, 2=Warning, 3=Error, 4=Critical)
+    VISIONTRACKER_API void SetLogLevel(int level);
+
+    // 로깅 함수들
+    VISIONTRACKER_API void LogDebug(const char* message);
+    VISIONTRACKER_API void LogInfo(const char* message);
+    VISIONTRACKER_API void LogWarning(const char* message);
+    VISIONTRACKER_API void LogError(const char* message);
+    VISIONTRACKER_API void LogCritical(const char* message);
+
+    // 로그 플러시
+    VISIONTRACKER_API void FlushLogger();
+
+    // 콘솔 창 제어
+    VISIONTRACKER_API bool AllocateConsole(const char* title);
+    VISIONTRACKER_API void FreeConsoleWindow();
 }
