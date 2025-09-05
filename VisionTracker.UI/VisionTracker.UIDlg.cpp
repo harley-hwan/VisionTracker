@@ -50,9 +50,9 @@ CVisionTrackerUIDlg::CVisionTrackerUIDlg(CWnd* pParent /*=NULL*/)
     , m_i_cropsizew(640)
     , m_i_cropsizeh(480)
     , m_f_fps(120)
-    , m_f_exposure(120)
+    , m_f_exposure(1000)
     , m_f_gamma(0.8f)
-    , m_f_gain(11.0f)
+    , m_f_gain(0.0f)
     , m_i_blacklevel(30)
     , m_bInitialized(FALSE)
     , m_bConnected(FALSE)
@@ -644,24 +644,48 @@ void CVisionTrackerUIDlg::ShowMatToStatic(const cv::Mat& mat, CStatic& ctrl)
     int stride = ((widthBytes + 3) / 4) * 4; // 4바이트 경계 정렬
     int padding = stride - widthBytes;
 
-    // DIB용 버퍼 생성 (패딩 포함)
-    std::vector<BYTE> dibBuffer;
-    if (padding > 0) {
-        dibBuffer.resize(stride * rgb.rows);
+    // DIB용 버퍼 준비 - 멤버 변수 재사용
+    const void* imageData = nullptr;
 
-        // 각 행마다 데이터 복사 (패딩 추가)
+    if (padding > 0) {
+        // 이미지 크기나 stride가 변경된 경우에만 버퍼 재할당
+        cv::Size currentSize(rgb.cols, rgb.rows);
+        size_t requiredSize = stride * rgb.rows;
+
+        if (m_lastImageSize != currentSize || m_lastStride != stride) {
+            // 버퍼 크기 조정 (capacity는 유지하면서 size만 변경)
+            m_dibBuffer.resize(requiredSize);
+            m_lastImageSize = currentSize;
+            m_lastStride = stride;
+
+            // 디버그 정보 (선택사항)
+#ifdef _DEBUG
+            TRACE(_T("DIB buffer resized: %dx%d, stride=%d, size=%zu bytes\n"),
+                currentSize.width, currentSize.height, stride, requiredSize);
+#endif
+        }
+
+        // 패딩을 포함한 데이터 복사
+        // 병렬 처리를 위해 OpenMP 사용 가능 (프로젝트 설정에서 활성화 필요)
+#pragma omp parallel for
         for (int y = 0; y < rgb.rows; y++) {
             const BYTE* srcRow = rgb.ptr<BYTE>(y);
-            BYTE* dstRow = &dibBuffer[y * stride];
+            BYTE* dstRow = &m_dibBuffer[y * stride];
 
             // 픽셀 데이터 복사
             memcpy(dstRow, srcRow, widthBytes);
 
-            // 패딩 영역 0으로 초기화
+            // 패딩 영역 0으로 초기화 (Windows 호환성)
             if (padding > 0) {
                 memset(dstRow + widthBytes, 0, padding);
             }
         }
+
+        imageData = m_dibBuffer.data();
+    }
+    else {
+        // 패딩이 없는 경우 원본 데이터 직접 사용
+        imageData = rgb.data;
     }
 
     // BITMAPINFO 구조체 설정
@@ -686,8 +710,6 @@ void CVisionTrackerUIDlg::ShowMatToStatic(const cv::Mat& mat, CStatic& ctrl)
     SetBrushOrgEx(m_memDC.GetSafeHdc(), 0, 0, NULL);
 
     // DIB 그리기
-    const void* imageData = padding > 0 ? (const void*)dibBuffer.data() : (const void*)rgb.data;
-
     int result = StretchDIBits(
         m_memDC.GetSafeHdc(),
         destX, destY, destWidth, destHeight,
@@ -703,6 +725,10 @@ void CVisionTrackerUIDlg::ShowMatToStatic(const cv::Mat& mat, CStatic& ctrl)
         CString errMsg;
         errMsg.Format(_T("StretchDIBits failed with error: %d"), err);
         OutputDebugString(errMsg);
+
+        // 에러 발생 시 버퍼 초기화 (다음 프레임에서 재시도)
+        m_lastImageSize = cv::Size(0, 0);
+        m_lastStride = 0;
     }
 
     // Picture Control을 다시 그리도록 요청
@@ -798,6 +824,10 @@ void CVisionTrackerUIDlg::OnDestroy()
         m_memBitmap.DeleteObject();
         m_memDC.DeleteDC();
     }
+
+    // DIB 버퍼 메모리 해제
+    m_dibBuffer.clear();
+    m_dibBuffer.shrink_to_fit(); // 메모리 완전 해제
 
     // 카메라 종료
     if (m_bConnected) {

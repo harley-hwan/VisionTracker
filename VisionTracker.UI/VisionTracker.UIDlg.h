@@ -106,4 +106,5 @@ private:
     // DIB ¹öÆÛ Ä³½Ì
     std::vector<BYTE> m_dibBuffer;
     cv::Size m_lastImageSize;
+    int m_lastStride;
 };
