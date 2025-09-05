@@ -4,6 +4,12 @@
 #include <io.h>
 #include <fcntl.h>
 #include <iostream>
+#include <atomic>
+#include <mutex>
+#include <thread>
+#include <chrono>
+#include <regex>
+#include <fstream>
 
 #ifdef min
 #undef min
@@ -20,68 +26,67 @@ using namespace cv;
 
 // 전역 설정 초기화
 WhiteBallDetectionConfig g_whiteBallConfig = {
-    cv::Rect(0, 0, 0, 0),           // roi는 0이면 full image 처리
-    ThresholdMode::Fixed,           // 기본 모드 Fixed
-    200,                            // threshold value
-    cv::THRESH_BINARY,              // threshold type
-    AdaptiveMethod::Gaussian,       // adaptiveMethod (미사용 시 무시됨)
-    7,                              // blockSize
-    2.0,                            // C
-    2.0f, 10.0f,                    // min/max radius
-    0.7f, 1.2f,                     // min/max circularity
-    true                            // useTracking 여부
+    cv::Rect(0, 0, 0, 0),
+    ThresholdMode::Fixed,
+    200,
+    cv::THRESH_BINARY,
+    AdaptiveMethod::Gaussian,
+    7,
+    2.0,
+    2.0f, 10.0f,
+    0.7f, 1.2f,
+    true
 };
 
-// 내부 상태 보관용 정적 변수들
+// 내부 상태 보관용 - 필수적인 스레드 안전성만 적용
 namespace {
-    // 카메라 핸들
+    // 카메라 핸들 및 연결 상태
     void* g_handle = nullptr;
+    std::mutex g_handleMutex;  // 핸들 생성/해제시만 사용
+    std::atomic<bool> g_isConnected(false);
 
-    // 카메라 열거 관련
+    // 카메라 정보
     MV_CC_DEVICE_INFO_LIST g_deviceList;
-    bool g_isConnected = false;
     CameraInfo g_connectedCameraInfo;
+    std::mutex g_cameraInfoMutex;
 
-    // 최신 프레임 (스레드 보호 필요)
+    // 프레임 버퍼
     cv::Mat g_latestFrame;
     std::mutex g_frameMutex;
 
-    // Grab 상태 및 FPS 계산용 변수
+    // FPS 계산 - atomic으로 충분
     std::atomic<bool> g_running(false);
+    std::atomic<double> g_lastFps(0.0);
     std::chrono::steady_clock::time_point g_lastTime;
-    int g_frameCount = 0;
-    double g_lastFps = 0.0;
+    std::atomic<int> g_frameCount(0);
 
-    // 볼 탐색 활성화 여부
+    // 볼 탐색 - atomic으로 충분
     std::atomic<bool> g_trackingActive(false);
+    std::atomic<bool> g_ballFound(false);
+    std::atomic<float> g_ballX(-1), g_ballY(-1), g_ballRadius(0);
+    std::atomic<double> g_lastDetectionTimeUs(0);
 
-    // ROI 처리
+    // ROI 설정
     cv::Rect g_roiRect;
     bool g_useRoi = false;
+    std::mutex g_roiMutex;
 
-    // 녹화 제어 변수
+    // 녹화 관련
     bool g_recording = false;
     std::string g_outputFolder;
-    int g_frameCounter = 0;
+    std::atomic<int> g_frameCounter(0);
+    std::mutex g_recordingMutex;
 
     // 타임스탬프
-    double g_lastTimestamp = 0.0;
+    std::atomic<double> g_lastTimestamp(0.0);
 
     // 선택된 카메라 IP
     std::string g_selectedIp = "";
+    std::mutex g_selectedIpMutex;
 
-    // 에러 메시지 전달용
+    // 에러 메시지
     std::string g_lastError = "";
-
-    // 현재 감지된 공 정보
-    cv::Point2f g_currentBallCenter(-1, -1);
-    float g_currentBallRadius = 0.0f;
-    bool g_currentBallFound = false;
-    std::mutex g_ballInfoMutex;
-
-    // 볼 탐지 처리 시간 (마이크로초)
-    double g_lastDetectionTimeUs = 0.0;
-    std::mutex g_detectionTimeMutex;
+    std::mutex g_errorMutex;
 
     // IP 변환 헬퍼 함수
     std::string ConvertIp(uint32_t ip) {
@@ -93,99 +98,155 @@ namespace {
             ip & 0xff);
         return std::string(buf);
     }
+
+    // 에러 메시지 설정 헬퍼
+    void SetLastError(const std::string& error) {
+        std::lock_guard<std::mutex> lock(g_errorMutex);
+        g_lastError = error;
+    }
+
+    // 재시도 가능한 연결 함수
+    bool ConnectWithRetry(MV_CC_DEVICE_INFO* pDeviceInfo, int maxRetries = 3, int delaySeconds = 2) {
+        for (int attempt = 0; attempt < maxRetries; attempt++) {
+            void* tempHandle = nullptr;
+
+            // 핸들 생성
+            int nRet = MV_CC_CreateHandle(&tempHandle, pDeviceInfo);
+            if (nRet != MV_OK) {
+                if (attempt < maxRetries - 1) {
+                    LOG_INFO("Handle creation failed, retrying...");
+                    std::this_thread::sleep_for(std::chrono::seconds(delaySeconds));
+                    continue;
+                }
+                SetLastError("핸들 생성 실패");
+                return false;
+            }
+
+            // 디바이스 열기
+            nRet = MV_CC_OpenDevice(tempHandle, MV_ACCESS_Exclusive, 0);
+            if (nRet == MV_OK) {
+                // 성공시 전역 핸들에 저장
+                std::lock_guard<std::mutex> lock(g_handleMutex);
+                g_handle = tempHandle;
+                return true;
+            }
+
+            // 실패시 핸들 정리
+            MV_CC_DestroyHandle(tempHandle);
+
+            if (attempt < maxRetries - 1) {
+                LOG_INFO("Device open failed, retrying in " + std::to_string(delaySeconds) + " seconds...");
+                std::this_thread::sleep_for(std::chrono::seconds(delaySeconds));
+            }
+        }
+
+        SetLastError("디바이스 열기 실패 (모든 재시도 실패)");
+        return false;
+    }
+
+    // 안전한 핸들 해제
+    void SafeReleaseHandle() {
+        std::lock_guard<std::mutex> lock(g_handleMutex);
+        if (g_handle) {
+            MV_CC_StopGrabbing(g_handle);
+            MV_CC_CloseDevice(g_handle);
+            MV_CC_DestroyHandle(g_handle);
+            g_handle = nullptr;
+        }
+    }
 }
 
 // 이미지 수신 콜백 함수
 extern "C" void __stdcall ImageCallback(unsigned char* pData, MV_FRAME_OUT_INFO_EX* pInfo, void* pUser)
 {
     if (!pInfo) return;
-    if (pInfo->enPixelType != PixelType_Gvsp_BGR8_Packed && pInfo->enPixelType != PixelType_Gvsp_Mono8) return;
+    if (pInfo->enPixelType != PixelType_Gvsp_BGR8_Packed &&
+        pInfo->enPixelType != PixelType_Gvsp_Mono8) return;
 
     cv::Mat frame;
-    {
-        if (pInfo->enPixelType == PixelType_Gvsp_Mono8) {
-            frame = cv::Mat(pInfo->nHeight, pInfo->nWidth, CV_8UC1, pData).clone();
-        }
-        else if (pInfo->enPixelType == PixelType_Gvsp_BGR8_Packed) {
-            frame = cv::Mat(pInfo->nHeight, pInfo->nWidth, CV_8UC3, pData).clone();
-        }
 
-        // ROI 적용
+    // 프레임 타입에 따른 처리
+    if (pInfo->enPixelType == PixelType_Gvsp_Mono8) {
+        frame = cv::Mat(pInfo->nHeight, pInfo->nWidth, CV_8UC1, pData).clone();
+    }
+    else if (pInfo->enPixelType == PixelType_Gvsp_BGR8_Packed) {
+        frame = cv::Mat(pInfo->nHeight, pInfo->nWidth, CV_8UC3, pData).clone();
+    }
+
+    // ROI 적용
+    {
+        std::lock_guard<std::mutex> roiLock(g_roiMutex);
         if (g_useRoi && g_roiRect.area() > 0 &&
             g_roiRect.x >= 0 && g_roiRect.y >= 0 &&
             g_roiRect.x + g_roiRect.width <= frame.cols &&
             g_roiRect.y + g_roiRect.height <= frame.rows) {
             frame = frame(g_roiRect);
         }
+    }
 
-        // 프레임 저장
-        {
-            std::lock_guard<std::mutex> lock(g_frameMutex);
-            g_latestFrame = frame.clone();
-            if (g_recording) {
-                char filename[256];
-                sprintf_s(filename, "%s/frame_%06d.png", g_outputFolder.c_str(), g_frameCounter++);
-                cv::imwrite(filename, g_latestFrame);
-            }
+    // 프레임 저장
+    {
+        std::lock_guard<std::mutex> lock(g_frameMutex);
+        g_latestFrame = frame.clone();
+    }
 
-            // 타임스탬프 갱신 (초 단위)
-            uint64_t timestampRaw = (static_cast<uint64_t>(pInfo->nDevTimeStampHigh) << 32) | pInfo->nDevTimeStampLow;
-            g_lastTimestamp = timestampRaw / 1e9;  // 초 단위 변환
+    // 녹화 처리
+    {
+        std::lock_guard<std::mutex> lock(g_recordingMutex);
+        if (g_recording && !frame.empty()) {
+            char filename[256];
+            sprintf_s(filename, "%s/frame_%06d.png", g_outputFolder.c_str(), g_frameCounter.load());
+            g_frameCounter++;
+            cv::imwrite(filename, frame);
         }
     }
+
+    // 타임스탬프 갱신
+    uint64_t timestampRaw = (static_cast<uint64_t>(pInfo->nDevTimeStampHigh) << 32) | pInfo->nDevTimeStampLow;
+    g_lastTimestamp = timestampRaw / 1e9;
 
     // FPS 계산
     g_frameCount++;
     auto now = std::chrono::steady_clock::now();
     double elapsed = static_cast<double>(std::chrono::duration_cast<std::chrono::milliseconds>(now - g_lastTime).count());
     if (elapsed >= 1000.0) {
-        g_lastFps = static_cast<double>(g_frameCount) * 1000.0 / elapsed;
+        g_lastFps = static_cast<double>(g_frameCount.load()) * 1000.0 / elapsed;
         g_frameCount = 0;
         g_lastTime = now;
     }
 
     // 볼 감지가 활성화된 경우
     if (g_trackingActive) {
-        // 처리 시간 측정 시작
         auto startTime = std::chrono::high_resolution_clock::now();
 
         int tmpX = 0, tmpY = 0, tmpR = 0, tmpPts = 0;
         bool found = GetWhiteBallInfo(&tmpX, &tmpY, &tmpR, &tmpPts);
 
-        // 처리 시간 측정 완료
         auto endTime = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime);
+        g_lastDetectionTimeUs = duration.count();
 
-        // 처리 시간 저장
-        {
-            std::lock_guard<std::mutex> timeLock(g_detectionTimeMutex);
-            g_lastDetectionTimeUs = duration.count();
-        }
-
-        // 프레임 카운터
         static int frameCounter = 0;
         frameCounter++;
 
-        std::lock_guard<std::mutex> lock(g_ballInfoMutex);
         if (found) {
-            g_currentBallCenter = cv::Point2f((float)tmpX, (float)tmpY);
-            g_currentBallRadius = (float)tmpR;
-            g_currentBallFound = true;
+            g_ballFound = true;
+            g_ballX = static_cast<float>(tmpX);
+            g_ballY = static_cast<float>(tmpY);
+            g_ballRadius = static_cast<float>(tmpR);
 
-            // 탐지 성공 로그 (처리 시간 포함)
             char logMsg[256];
             sprintf_s(logMsg, "[Frame %06d] Ball FOUND - Position: (%.1f, %.1f), Radius: %.1f, Processing: %.2f ms",
-                frameCounter, g_currentBallCenter.x, g_currentBallCenter.y, g_currentBallRadius,
-                g_lastDetectionTimeUs / 1000.0);
+                frameCounter, g_ballX.load(), g_ballY.load(), g_ballRadius.load(),
+                g_lastDetectionTimeUs.load() / 1000.0);
             LOG_INFO(std::string(logMsg));
         }
         else {
-            g_currentBallFound = false;
+            g_ballFound = false;
 
-            // 탐지 실패 로그 (처리 시간 포함)
             char logMsg[256];
             sprintf_s(logMsg, "[Frame %06d] Ball NOT FOUND, Processing: %.2f ms",
-                frameCounter, g_lastDetectionTimeUs / 1000.0);
+                frameCounter, g_lastDetectionTimeUs.load() / 1000.0);
             LOG_DEBUG(std::string(logMsg));
         }
     }
@@ -193,6 +254,7 @@ extern "C" void __stdcall ImageCallback(unsigned char* pData, MV_FRAME_OUT_INFO_
 
 // API 구현부
 extern "C" VISIONTRACKER_API const char* GetLastErrorMessage() {
+    std::lock_guard<std::mutex> lock(g_errorMutex);
     return g_lastError.c_str();
 }
 
@@ -203,7 +265,7 @@ extern "C" VISIONTRACKER_API int EnumerateCameras(CameraInfo* cameras, int maxCo
 
     int nRet = MV_CC_EnumDevices(MV_GIGE_DEVICE | MV_USB_DEVICE, &g_deviceList);
     if (nRet != MV_OK) {
-        g_lastError = "디바이스 열거 실패";
+        SetLastError("디바이스 열거 실패");
         return 0;
     }
 
@@ -250,54 +312,22 @@ extern "C" VISIONTRACKER_API bool ConnectCameraByIndex(int index)
     }
 
     if (index < 0 || index >= (int)g_deviceList.nDeviceNum) {
-        g_lastError = "잘못된 카메라 인덱스";
+        SetLastError("잘못된 카메라 인덱스");
         return false;
     }
 
     MV_CC_DEVICE_INFO* pDeviceInfo = g_deviceList.pDeviceInfo[index];
 
-    int nRet = MV_CC_CreateHandle(&g_handle, pDeviceInfo);
-    if (nRet != MV_OK) {
-        g_lastError = "핸들 생성 실패";
+    // 재시도 가능한 연결
+    if (!ConnectWithRetry(pDeviceInfo, 3, 2)) {
         return false;
     }
 
-    nRet = MV_CC_OpenDevice(g_handle, MV_ACCESS_Exclusive, 0);
-    if (nRet != MV_OK) {
-        // 재시도 로직
-        int timeoutSeconds = 30;
-        const int intervalMs = 2000;
-        int elapsed = 0;
-
-        while (elapsed < timeoutSeconds * 1000) {
-            MV_CC_DestroyHandle(g_handle);
-            g_handle = nullptr;
-
-            nRet = MV_CC_CreateHandle(&g_handle, pDeviceInfo);
-            if (nRet != MV_OK) continue;
-
-            nRet = MV_CC_OpenDevice(g_handle, MV_ACCESS_Exclusive, 0);
-            if (nRet == MV_OK) break;
-
-            std::this_thread::sleep_for(std::chrono::milliseconds(intervalMs));
-            elapsed += intervalMs;
-        }
-
-        if (nRet != MV_OK) {
-            MV_CC_DestroyHandle(g_handle);
-            g_handle = nullptr;
-            g_lastError = "디바이스 열기 실패";
-            return false;
-        }
-    }
-
     // 콜백 등록
-    nRet = MV_CC_RegisterImageCallBackEx(g_handle, ImageCallback, nullptr);
+    int nRet = MV_CC_RegisterImageCallBackEx(g_handle, ImageCallback, nullptr);
     if (nRet != MV_OK) {
-        MV_CC_CloseDevice(g_handle);
-        MV_CC_DestroyHandle(g_handle);
-        g_handle = nullptr;
-        g_lastError = "콜백 등록 실패";
+        SafeReleaseHandle();
+        SetLastError("콜백 등록 실패");
         return false;
     }
 
@@ -316,17 +346,21 @@ extern "C" VISIONTRACKER_API bool ConnectCameraByIndex(int index)
     g_isConnected = true;
 
     // 연결된 카메라 정보 저장
-    memset(&g_connectedCameraInfo, 0, sizeof(CameraInfo));
-    if (pDeviceInfo->nTLayerType == MV_GIGE_DEVICE) {
-        MV_GIGE_DEVICE_INFO& info = pDeviceInfo->SpecialInfo.stGigEInfo;
-        sprintf_s(g_connectedCameraInfo.modelName, "%s", info.chModelName);
-        sprintf_s(g_connectedCameraInfo.serialNumber, "%s", info.chSerialNumber);
-        sprintf_s(g_connectedCameraInfo.ipAddress, "%s", ConvertIp(info.nCurrentIp).c_str());
-        sprintf_s(g_connectedCameraInfo.displayName, "%s [%s] - %s",
-                  g_connectedCameraInfo.modelName,
-                  g_connectedCameraInfo.serialNumber,
-                  g_connectedCameraInfo.ipAddress);
-        g_connectedCameraInfo.deviceType = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_cameraInfoMutex);
+        memset(&g_connectedCameraInfo, 0, sizeof(CameraInfo));
+
+        if (pDeviceInfo->nTLayerType == MV_GIGE_DEVICE) {
+            MV_GIGE_DEVICE_INFO& info = pDeviceInfo->SpecialInfo.stGigEInfo;
+            sprintf_s(g_connectedCameraInfo.modelName, "%s", info.chModelName);
+            sprintf_s(g_connectedCameraInfo.serialNumber, "%s", info.chSerialNumber);
+            sprintf_s(g_connectedCameraInfo.ipAddress, "%s", ConvertIp(info.nCurrentIp).c_str());
+            sprintf_s(g_connectedCameraInfo.displayName, "%s [%s] - %s",
+                g_connectedCameraInfo.modelName,
+                g_connectedCameraInfo.serialNumber,
+                g_connectedCameraInfo.ipAddress);
+            g_connectedCameraInfo.deviceType = 0;
+        }
     }
 
     g_lastTime = std::chrono::steady_clock::now();
@@ -342,9 +376,7 @@ extern "C" VISIONTRACKER_API bool DisconnectCamera()
     if (!g_handle) return false;
 
     StopGrab();
-    MV_CC_CloseDevice(g_handle);
-    MV_CC_DestroyHandle(g_handle);
-    g_handle = nullptr;
+    SafeReleaseHandle();
     g_isConnected = false;
 
     return true;
@@ -360,6 +392,8 @@ extern "C" VISIONTRACKER_API bool IsConnected()
 extern "C" VISIONTRACKER_API bool GetConnectedCameraInfo(CameraInfo* info)
 {
     if (!g_isConnected || !info) return false;
+
+    std::lock_guard<std::mutex> lock(g_cameraInfoMutex);
     *info = g_connectedCameraInfo;
     return true;
 }
@@ -377,7 +411,7 @@ extern "C" VISIONTRACKER_API bool IsNodeSupported(const char* nodeName)
 extern "C" VISIONTRACKER_API bool SetTriggerMode(bool enable)
 {
     if (!g_handle) {
-        g_lastError = "카메라 핸들이 초기화되지 않았습니다.";
+        SetLastError("카메라 핸들이 초기화되지 않았습니다.");
         return false;
     }
 
@@ -443,6 +477,7 @@ extern "C" VISIONTRACKER_API void StopGrab()
 
 extern "C" VISIONTRACKER_API bool StartRecording(const char* folderPath)
 {
+    std::lock_guard<std::mutex> lock(g_recordingMutex);
     g_outputFolder = folderPath;
     g_frameCounter = 0;
     g_recording = true;
@@ -451,6 +486,7 @@ extern "C" VISIONTRACKER_API bool StartRecording(const char* folderPath)
 
 extern "C" VISIONTRACKER_API void StopRecording()
 {
+    std::lock_guard<std::mutex> lock(g_recordingMutex);
     g_recording = false;
 }
 
@@ -499,7 +535,7 @@ extern "C" VISIONTRACKER_API double GetCurrentBrightness()
 
 extern "C" VISIONTRACKER_API double GetCurrentFps()
 {
-    return g_lastFps;
+    return g_lastFps.load();
 }
 
 extern "C" VISIONTRACKER_API bool SetFrameRate(float fps)
@@ -547,7 +583,7 @@ extern "C" VISIONTRACKER_API bool EnableGamma(bool enable)
     int nRet = MV_CC_SetBoolValue(g_handle, "GammaEnable", enable);
     if (nRet != MV_OK) {
         printf("GammaEnable 설정 실패\n");
-        g_lastError = "GammaEnable 설정 실패";
+        SetLastError("GammaEnable 설정 실패");
         return false;
     }
 
@@ -571,7 +607,7 @@ extern "C" VISIONTRACKER_API bool GetGamma(float* gammaValue)
 
 extern "C" VISIONTRACKER_API bool SetROI(int x, int y, int width, int height)
 {
-    std::lock_guard<std::mutex> lock(g_frameMutex);
+    std::lock_guard<std::mutex> lock(g_roiMutex);
     g_roiRect = cv::Rect(x, y, width, height);
     g_useRoi = true;
     return true;
@@ -592,7 +628,7 @@ extern "C" VISIONTRACKER_API bool GetWhiteBallInfo(int* centerX, int* centerY, i
     else
         gray = g_latestFrame;
 
-    // 볼 검출용 ROI 설정 - 수정된 부분
+    // 볼 검출용 ROI 설정
     cv::Rect roiRect = g_whiteBallConfig.roi;
 
     // ROI가 설정되지 않았거나 (0,0,0,0)이면 전체 이미지 사용
@@ -699,13 +735,11 @@ extern "C" VISIONTRACKER_API bool GetWhiteBallInfo(int* centerX, int* centerY, i
 
 extern "C" VISIONTRACKER_API void SetWhiteBallDetectionConfig(const WhiteBallDetectionConfig& config)
 {
-    std::lock_guard<std::mutex> lock(g_frameMutex);
     g_whiteBallConfig = config;
 }
 
 extern "C" VISIONTRACKER_API WhiteBallDetectionConfig GetWhiteBallDetectionConfig()
 {
-    std::lock_guard<std::mutex> lock(g_frameMutex);
     return g_whiteBallConfig;
 }
 
@@ -731,7 +765,7 @@ extern "C" VISIONTRACKER_API bool EnableBlackLevel(bool enable)
     int nRet = MV_CC_SetBoolValue(g_handle, "BlackLevelEnable", enable);
     if (nRet != MV_OK) {
         printf("BlackLevelEnable 설정 실패\n");
-        g_lastError = "BlackLevelEnable 설정 실패";
+        SetLastError("BlackLevelEnable 설정 실패");
         return false;
     }
 
@@ -755,12 +789,13 @@ extern "C" VISIONTRACKER_API bool GetBlackLevel(int* blackLevelValue)
 
 extern "C" VISIONTRACKER_API double GetLastTimestamp()
 {
-    return g_lastTimestamp;
+    return g_lastTimestamp.load();
 }
 
 extern "C" VISIONTRACKER_API bool SelectCameraByIP(const char* ipAddress)
 {
     if (!ipAddress) return false;
+    std::lock_guard<std::mutex> lock(g_selectedIpMutex);
     g_selectedIp = ipAddress;
     std::cout << "g_selectedIp: " << g_selectedIp << std::endl;
     return true;
@@ -776,6 +811,7 @@ extern "C" VISIONTRACKER_API bool SelectCameraFromFile(const char* filepath)
     while (std::getline(infile, line)) {
         std::smatch match;
         if (std::regex_search(line, match, ipRegex)) {
+            std::lock_guard<std::mutex> lock(g_selectedIpMutex);
             g_selectedIp = match[1];
             return true;
         }
@@ -786,16 +822,19 @@ extern "C" VISIONTRACKER_API bool SelectCameraFromFile(const char* filepath)
 extern "C" VISIONTRACKER_API void StartTracking()
 {
     g_trackingActive = true;
+    g_ballFound = false;
+    g_ballX = -1;
+    g_ballY = -1;
+    g_ballRadius = 0;
 }
 
 extern "C" VISIONTRACKER_API void StopTracking()
 {
     g_trackingActive = false;
-
-    std::lock_guard<std::mutex> lock(g_ballInfoMutex);
-    g_currentBallFound = false;
-    g_currentBallCenter = cv::Point2f(-1, -1);
-    g_currentBallRadius = 0.0f;
+    g_ballFound = false;
+    g_ballX = -1;
+    g_ballY = -1;
+    g_ballRadius = 0;
 }
 
 extern "C" VISIONTRACKER_API bool IsTrackingActive()
@@ -805,31 +844,29 @@ extern "C" VISIONTRACKER_API bool IsTrackingActive()
 
 extern "C" VISIONTRACKER_API void GetCurrentBallPosition(float* x, float* y, float* radius, bool* found)
 {
-    std::lock_guard<std::mutex> lock(g_ballInfoMutex);
-    if (x) *x = g_currentBallCenter.x;
-    if (y) *y = g_currentBallCenter.y;
-    if (radius) *radius = g_currentBallRadius;
-    if (found) *found = g_currentBallFound;
+    if (x) *x = g_ballX.load();
+    if (y) *y = g_ballY.load();
+    if (radius) *radius = g_ballRadius.load();
+    if (found) *found = g_ballFound.load();
 }
 
 extern "C" VISIONTRACKER_API double GetLastDetectionTimeMs()
 {
-    std::lock_guard<std::mutex> lock(g_detectionTimeMutex);
-    return g_lastDetectionTimeUs / 1000.0; 
+    return g_lastDetectionTimeUs.load() / 1000.0;
 }
 
 // 기존 InitCamera - deprecated
 extern "C" VISIONTRACKER_API bool InitCamera()
 {
     printf("Warning: InitCamera() is deprecated. Use EnumerateCameras() and ConnectCameraByIndex() instead.\n");
-    g_lastError.clear();
+    SetLastError("");
 
     MV_CC_DEVICE_INFO_LIST stDeviceList;
     memset(&stDeviceList, 0, sizeof(MV_CC_DEVICE_INFO_LIST));
 
     int nRet = MV_CC_EnumDevices(MV_GIGE_DEVICE | MV_USB_DEVICE, &stDeviceList);
     if (nRet != MV_OK || stDeviceList.nDeviceNum == 0) {
-        g_lastError = "디바이스 나열 실패 또는 장치 없음.";
+        SetLastError("디바이스 나열 실패 또는 장치 없음.");
         return false;
     }
 
@@ -841,7 +878,7 @@ extern "C" VISIONTRACKER_API void CloseCamera()
     DisconnectCamera();
 }
 
-// ===== Logger 인터페이스 구현 =====
+// Logger 인터페이스 구현
 extern "C" VISIONTRACKER_API bool InitializeLogger(const char* filePath, int logLevel, size_t maxFileSize, int maxBackupFiles)
 {
     try {
@@ -856,7 +893,7 @@ extern "C" VISIONTRACKER_API bool InitializeLogger(const char* filePath, int log
         return true;
     }
     catch (const std::exception& e) {
-        g_lastError = std::string("Logger initialization failed: ") + e.what();
+        SetLastError(std::string("Logger initialization failed: ") + e.what());
         return false;
     }
 }
@@ -917,15 +954,12 @@ extern "C" VISIONTRACKER_API void FlushLogger()
 extern "C" VISIONTRACKER_API bool AllocateConsole(const char* title)
 {
     if (::AllocConsole()) {
-        // stdout, stderr를 콘솔로 리다이렉트
         FILE* pCout;
         freopen_s(&pCout, "CONOUT$", "w", stdout);
         freopen_s(&pCout, "CONOUT$", "w", stderr);
 
-        // std::cout과 동기화
         std::ios::sync_with_stdio();
 
-        // 콘솔 제목 설정
         if (title) {
             SetConsoleTitleA(title);
         }
@@ -933,12 +967,11 @@ extern "C" VISIONTRACKER_API bool AllocateConsole(const char* title)
             SetConsoleTitleA("Vision Tracker Console");
         }
 
-        // 콘솔 창 크기 조정
         HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
-        COORD bufferSize = { 120, 3000 };  // 버퍼 크기
+        COORD bufferSize = { 120, 3000 };
         SetConsoleScreenBufferSize(hConsole, bufferSize);
 
-        SMALL_RECT windowSize = { 0, 0, 119, 30 };  // 창 크기
+        SMALL_RECT windowSize = { 0, 0, 119, 30 };
         SetConsoleWindowInfo(hConsole, TRUE, &windowSize);
 
         return true;

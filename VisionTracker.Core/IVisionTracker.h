@@ -63,6 +63,10 @@ extern "C" {
     // 카메라 검색 및 연결
     VISIONTRACKER_API int EnumerateCameras(CameraInfo* cameras, int maxCount);
     VISIONTRACKER_API bool ConnectCameraByIndex(int index);
+    VISIONTRACKER_API bool ConnectCameraByIndexAsync(int index); // 비동기 연결
+    VISIONTRACKER_API int GetConnectionStatus(); // 0: 미연결, 1: 연결중, 2: 연결됨, -1: 실패
+    VISIONTRACKER_API void SetRetryPolicy(int maxAttempts, int initialDelayMs,
+        int maxDelayMs, bool useExponentialBackoff);
     VISIONTRACKER_API bool DisconnectCamera();
     VISIONTRACKER_API bool IsConnected();
     VISIONTRACKER_API bool GetConnectedCameraInfo(CameraInfo* info);
@@ -73,7 +77,7 @@ extern "C" {
     VISIONTRACKER_API void CloseCamera();
 
     // 트리거 모드 설정 (Master/Slave)
-    VISIONTRACKER_API bool SetTriggerMode(bool enable); // Master(false), Slave(true)
+    VISIONTRACKER_API bool SetTriggerMode(bool enable);
 
     // 영상 캡처 시작 및 중단
     VISIONTRACKER_API void StartGrab();
@@ -128,22 +132,16 @@ extern "C" {
     VISIONTRACKER_API bool SelectCameraByIP(const char* ipAddress);
     VISIONTRACKER_API bool SelectCameraFromFile(const char* filepath);
 
-    // ===== Logger 인터페이스 =====
-    // Logger 초기화 및 종료
-    VISIONTRACKER_API bool InitializeLogger(const char* filePath, int logLevel, size_t maxFileSize, int maxBackupFiles);
+    // Logger 인터페이스
+    VISIONTRACKER_API bool InitializeLogger(const char* filePath, int logLevel,
+        size_t maxFileSize, int maxBackupFiles);
     VISIONTRACKER_API void ShutdownLogger();
-
-    // 로그 레벨 설정 (0=Debug, 1=Info, 2=Warning, 3=Error, 4=Critical)
     VISIONTRACKER_API void SetLogLevel(int level);
-
-    // 로깅 함수들
     VISIONTRACKER_API void LogDebug(const char* message);
     VISIONTRACKER_API void LogInfo(const char* message);
     VISIONTRACKER_API void LogWarning(const char* message);
     VISIONTRACKER_API void LogError(const char* message);
     VISIONTRACKER_API void LogCritical(const char* message);
-
-    // 로그 플러시
     VISIONTRACKER_API void FlushLogger();
 
     // 콘솔 창 제어
