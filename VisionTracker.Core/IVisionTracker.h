@@ -120,6 +120,9 @@ extern "C" {
     VISIONTRACKER_API bool IsTrackingActive();
     VISIONTRACKER_API void GetCurrentBallPosition(float* x, float* y, float* radius, bool* found);
 
+    // 볼 탐지 처리 시간 조회 (밀리초)
+    VISIONTRACKER_API double GetLastDetectionTimeMs();
+
     // 카메라 선택
     VISIONTRACKER_API double GetLastTimestamp();
     VISIONTRACKER_API bool SelectCameraByIP(const char* ipAddress);

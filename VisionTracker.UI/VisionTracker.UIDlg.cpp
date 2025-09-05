@@ -745,18 +745,25 @@ void CVisionTrackerUIDlg::OnTimer(UINT_PTR nIDEvent)
             bool found;
             GetCurrentBallPosition(&x, &y, &radius, &found);
 
+            // 처리 시간 가져오기
+            double processingTimeMs = GetLastDetectionTimeMs();
+
             if (found) {
                 // 공의 위치에 초록색 원 그리기
                 cv::circle(disp, cv::Point((int)x, (int)y), (int)radius, cv::Scalar(0, 255, 0), 2);
                 cv::circle(disp, cv::Point((int)x, (int)y), 2, cv::Scalar(0, 0, 255), -1);
 
-                // 좌표 정보 표시
+                // 좌표 정보와 처리 시간 표시
                 CString info;
-                info.Format(_T("Ball Position: (%.0f, %.0f), Radius: %.0f"), x, y, radius);
+                info.Format(_T("Ball Position: (%.0f, %.0f), Radius: %.0f, Time: %.2fms"),
+                    x, y, radius, processingTimeMs);
                 m_ballInfoCtrl.SetWindowText(info);
             }
             else {
-                m_ballInfoCtrl.SetWindowText(_T("Ball Not Found"));
+                // 공을 찾지 못한 경우에도 처리 시간 표시
+                CString info;
+                info.Format(_T("Ball Not Found (Time: %.2fms)"), processingTimeMs);
+                m_ballInfoCtrl.SetWindowText(info);
             }
         }
         else {

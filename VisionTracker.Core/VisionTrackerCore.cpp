@@ -79,6 +79,10 @@ namespace {
     bool g_currentBallFound = false;
     std::mutex g_ballInfoMutex;
 
+    // 볼 탐지 처리 시간 (마이크로초)
+    double g_lastDetectionTimeUs = 0.0;
+    std::mutex g_detectionTimeMutex;
+
     // IP 변환 헬퍼 함수
     std::string ConvertIp(uint32_t ip) {
         char buf[32] = {};
@@ -142,8 +146,21 @@ extern "C" void __stdcall ImageCallback(unsigned char* pData, MV_FRAME_OUT_INFO_
 
     // 볼 감지가 활성화된 경우
     if (g_trackingActive) {
+        // 처리 시간 측정 시작
+        auto startTime = std::chrono::high_resolution_clock::now();
+
         int tmpX = 0, tmpY = 0, tmpR = 0, tmpPts = 0;
         bool found = GetWhiteBallInfo(&tmpX, &tmpY, &tmpR, &tmpPts);
+
+        // 처리 시간 측정 완료
+        auto endTime = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime);
+
+        // 처리 시간 저장
+        {
+            std::lock_guard<std::mutex> timeLock(g_detectionTimeMutex);
+            g_lastDetectionTimeUs = duration.count();
+        }
 
         // 프레임 카운터
         static int frameCounter = 0;
@@ -155,18 +172,20 @@ extern "C" void __stdcall ImageCallback(unsigned char* pData, MV_FRAME_OUT_INFO_
             g_currentBallRadius = (float)tmpR;
             g_currentBallFound = true;
 
-            // 탐지 성공 로그
+            // 탐지 성공 로그 (처리 시간 포함)
             char logMsg[256];
-            sprintf_s(logMsg, "[Frame %06d] Ball FOUND - Position: (%.1f, %.1f), Radius: %.1f",
-                frameCounter, g_currentBallCenter.x, g_currentBallCenter.y, g_currentBallRadius);
+            sprintf_s(logMsg, "[Frame %06d] Ball FOUND - Position: (%.1f, %.1f), Radius: %.1f, Processing: %.2f ms",
+                frameCounter, g_currentBallCenter.x, g_currentBallCenter.y, g_currentBallRadius,
+                g_lastDetectionTimeUs / 1000.0);
             LOG_INFO(std::string(logMsg));
         }
         else {
             g_currentBallFound = false;
 
-            // 탐지 실패 로그
+            // 탐지 실패 로그 (처리 시간 포함)
             char logMsg[256];
-            sprintf_s(logMsg, "[Frame %06d] Ball NOT FOUND", frameCounter);
+            sprintf_s(logMsg, "[Frame %06d] Ball NOT FOUND, Processing: %.2f ms",
+                frameCounter, g_lastDetectionTimeUs / 1000.0);
             LOG_DEBUG(std::string(logMsg));
         }
     }
@@ -304,9 +323,9 @@ extern "C" VISIONTRACKER_API bool ConnectCameraByIndex(int index)
         sprintf_s(g_connectedCameraInfo.serialNumber, "%s", info.chSerialNumber);
         sprintf_s(g_connectedCameraInfo.ipAddress, "%s", ConvertIp(info.nCurrentIp).c_str());
         sprintf_s(g_connectedCameraInfo.displayName, "%s [%s] - %s",
-            g_connectedCameraInfo.modelName,
-            g_connectedCameraInfo.serialNumber,
-            g_connectedCameraInfo.ipAddress);
+                  g_connectedCameraInfo.modelName,
+                  g_connectedCameraInfo.serialNumber,
+                  g_connectedCameraInfo.ipAddress);
         g_connectedCameraInfo.deviceType = 0;
     }
 
@@ -791,6 +810,12 @@ extern "C" VISIONTRACKER_API void GetCurrentBallPosition(float* x, float* y, flo
     if (y) *y = g_currentBallCenter.y;
     if (radius) *radius = g_currentBallRadius;
     if (found) *found = g_currentBallFound;
+}
+
+extern "C" VISIONTRACKER_API double GetLastDetectionTimeMs()
+{
+    std::lock_guard<std::mutex> lock(g_detectionTimeMutex);
+    return g_lastDetectionTimeUs / 1000.0; 
 }
 
 // 기존 InitCamera - deprecated
