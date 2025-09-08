@@ -30,6 +30,7 @@ protected:
     afx_msg HCURSOR OnQueryDragIcon();
     afx_msg BOOL OnEraseBkgnd(CDC* pDC);
     afx_msg void OnDrawItem(int nIDCtl, LPDRAWITEMSTRUCT lpDrawItemStruct);
+    virtual BOOL PreTranslateMessage(MSG* pMsg);  // 추가
     DECLARE_MESSAGE_MAP()
 
 public:
@@ -107,4 +108,8 @@ private:
     std::vector<BYTE> m_dibBuffer;
     cv::Size m_lastImageSize;
     int m_lastStride;
+
+    // 클릭 위치 정보 저장용 추가
+    cv::Mat m_currentFrame;  // 현재 프레임 저장
+    CRect m_imageDisplayRect;  // 실제 이미지 표시 영역
 };

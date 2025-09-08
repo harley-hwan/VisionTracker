@@ -51,7 +51,7 @@ CVisionTrackerUIDlg::CVisionTrackerUIDlg(CWnd* pParent /*=NULL*/)
     , m_i_cropsizeh(480)
     , m_f_fps(120)
     , m_f_exposure(1000)
-    , m_f_gamma(0.8f)
+    , m_f_gamma(0.7f)
     , m_f_gain(0.0f)
     , m_i_blacklevel(30)
     , m_bInitialized(FALSE)
@@ -113,7 +113,7 @@ BOOL CVisionTrackerUIDlg::OnInitDialog()
     AllocateConsole("Vision Tracker Console");
 
     // Logger 초기화 (0=Debug, 1=Info, 2=Warning, 3=Error, 4=Critical)
-    InitializeLogger("VisionTracker.log", 0, 50 * 1024 * 1024, 10);  // Debug 레벨, 50MB, 10개 파일
+    InitializeLogger(NULL, 0, 50 * 1024 * 1024, 10);  // Debug 레벨, 50MB, 10개 파일
     LogInfo("=== Vision Tracker UI Started ===");
 
     // 시스템 메뉴에 "정보..." 메뉴 항목을 추가합니다.
@@ -182,6 +182,10 @@ BOOL CVisionTrackerUIDlg::OnInitDialog()
     // Picture Control 강제 다시 그리기
     m_imageCtrl.Invalidate();
     m_imageCtrl.UpdateWindow();
+
+    // Picture Control의 스타일을 Owner Draw로 변경 - SS_NOTIFY 필수!
+    m_imageCtrl.ModifyStyle(0, SS_NOTIFY);  // SS_NOTIFY 추가
+    m_imageCtrl.ModifyStyle(SS_BLACKFRAME | SS_CENTERIMAGE, SS_OWNERDRAW);
 
     // 초기 상태 설정
     m_bConnected = FALSE;
@@ -299,6 +303,80 @@ void CVisionTrackerUIDlg::OnDrawItem(int nIDCtl, LPDRAWITEMSTRUCT lpDrawItemStru
     {
         CDialogEx::OnDrawItem(nIDCtl, lpDrawItemStruct);
     }
+}
+
+BOOL CVisionTrackerUIDlg::PreTranslateMessage(MSG* pMsg)
+{
+    // 마우스 왼쪽 버튼 클릭 감지
+    if (pMsg->message == WM_LBUTTONDOWN)
+    {
+        // 클릭이 Picture Control에서 발생했는지 확인
+        CWnd* pWnd = CWnd::FromHandle(pMsg->hwnd);
+        if (pWnd && pWnd->GetDlgCtrlID() == IDC_STATIC_IMAGE)
+        {
+            // 클릭 위치 가져오기
+            CPoint point(GET_X_LPARAM(pMsg->lParam), GET_Y_LPARAM(pMsg->lParam));
+
+            // 이미지 클릭 처리
+            if (!m_currentFrame.empty() && m_bConnected)
+            {
+                // Picture Control의 클라이언트 좌표를 이미지 좌표로 변환
+                if (!m_imageDisplayRect.PtInRect(point))
+                {
+                    SetDlgItemText(IDC_STATIC_SYSTEM_STATUS, _T("클릭 위치가 이미지 영역 밖입니다"));
+                    return CDialogEx::PreTranslateMessage(pMsg);
+                }
+
+                // 표시 영역 내에서의 상대 좌표 계산
+                int displayX = point.x - m_imageDisplayRect.left;
+                int displayY = point.y - m_imageDisplayRect.top;
+
+                // 원본 이미지 좌표로 변환
+                int imgX = (displayX * m_currentFrame.cols) / m_imageDisplayRect.Width();
+                int imgY = (displayY * m_currentFrame.rows) / m_imageDisplayRect.Height();
+
+                // 범위 체크
+                imgX = std::max(0, std::min(imgX, m_currentFrame.cols - 1));
+                imgY = std::max(0, std::min(imgY, m_currentFrame.rows - 1));
+
+                // 픽셀 밝기값 읽기
+                int brightness = 0;
+                CString pixelInfo;
+
+                if (m_currentFrame.channels() == 1)
+                {
+                    brightness = m_currentFrame.at<uchar>(imgY, imgX);
+                    pixelInfo.Format(_T("Gray: %d"), brightness);
+                }
+                else if (m_currentFrame.channels() == 3)
+                {
+                    cv::Vec3b pixel = m_currentFrame.at<cv::Vec3b>(imgY, imgX);
+                    // BGR to Gray 변환 공식
+                    brightness = (int)(0.114 * pixel[0] + 0.587 * pixel[1] + 0.299 * pixel[2]);
+                    pixelInfo.Format(_T("BGR(%d,%d,%d), Gray: %d"),
+                        pixel[2], pixel[1], pixel[0], brightness);  // BGR->RGB 순서로 표시
+                }
+
+                // ROI 적용된 좌표인 경우 원본 좌표로 변환
+                int originalX = imgX + m_i_cropposx;
+                int originalY = imgY + m_i_cropposy;
+
+                // 정보 출력
+                CString info;
+                info.Format(_T("클릭: (%d, %d) | 원본: (%d, %d) | %s"),
+                    imgX, imgY, originalX, originalY, pixelInfo);
+                SetDlgItemText(IDC_STATIC_SYSTEM_STATUS, info);
+
+                // 로그에도 기록
+                CString logMsg;
+                logMsg.Format(_T("Mouse clicked at (%d,%d), Original(%d,%d), Brightness=%d"),
+                    imgX, imgY, originalX, originalY, brightness);
+                LogInfo(CT2A(logMsg));
+            }
+        }
+    }
+
+    return CDialogEx::PreTranslateMessage(pMsg);
 }
 
 float CVisionTrackerUIDlg::GetDlgItemFloat(int nID)
@@ -549,8 +627,7 @@ void CVisionTrackerUIDlg::OnBnClickedButton1()
 
     // 로그에 기록
     CString logMsg;
-    logMsg.Format(_T("Capture started - ROI: (%d, %d, %dx%d), FPS: %.1f, Exposure: %.1f"),
-        cropX, cropY, cropW, cropH, fps, exposure);
+    logMsg.Format(_T("Capture started - ROI: (%d, %d, %dx%d), FPS: %.1f, Exposure: %.1f"), cropX, cropY, cropW, cropH, fps, exposure);
     LogInfo(CT2A(logMsg));
 
     StartGrab();                    // DLL 프레임 수신 시작
@@ -559,7 +636,6 @@ void CVisionTrackerUIDlg::OnBnClickedButton1()
     GetDlgItem(IDC_BUTTON2)->EnableWindow(TRUE);  // Stop 버튼 활성화
     SetDlgItemText(IDC_STATIC_SYSTEM_STATUS, _T("캡처 시작됨"));
 }
-
 
 void CVisionTrackerUIDlg::OnBnClickedButton2()
 {
@@ -591,6 +667,9 @@ void CVisionTrackerUIDlg::ShowMatToStatic(const cv::Mat& mat, CStatic& ctrl)
         return;
     }
 
+    // mat 저장 (클릭 이벤트용)
+    m_currentFrame = mat.clone();
+
     // 배경을 먼저 검은색으로 채움
     CBrush blackBrush(RGB(0, 0, 0));
     m_memDC.FillRect(&rect, &blackBrush);
@@ -616,20 +695,39 @@ void CVisionTrackerUIDlg::ShowMatToStatic(const cv::Mat& mat, CStatic& ctrl)
         destY = 0;
     }
 
-    // 영상 크기 맞추기
-    cv::Mat resized;
-    cv::resize(mat, resized, cv::Size(destWidth, destHeight), 0, 0, cv::INTER_LINEAR);
+    // 실제 이미지 표시 영역 저장
+    m_imageDisplayRect = CRect(destX, destY, destX + destWidth, destY + destHeight);
+
+    // 성능 최적화: 캐시된 프레임 사용
+    static cv::Mat cachedResized;
+    static cv::Size lastSize;
+    static int lastType = -1;
+
+    cv::Size newSize(destWidth, destHeight);
+    bool needResize = (cachedResized.empty() ||
+        lastSize != newSize ||
+        mat.type() != lastType);
+
+    if (needResize) {
+        cv::resize(mat, cachedResized, newSize, 0, 0, cv::INTER_LINEAR);
+        lastSize = newSize;
+        lastType = mat.type();
+    }
+    else {
+        // 크기가 같은 경우 resize 대신 copyTo 사용
+        cv::resize(mat, cachedResized, newSize, 0, 0, cv::INTER_LINEAR);
+    }
 
     // BGR/GRAY to RGB 변환 및 연속 메모리 보장
     cv::Mat rgb;
-    if (resized.channels() == 1) {
-        cv::cvtColor(resized, rgb, cv::COLOR_GRAY2RGB);
+    if (cachedResized.channels() == 1) {
+        cv::cvtColor(cachedResized, rgb, cv::COLOR_GRAY2RGB);
     }
-    else if (resized.channels() == 3) {
-        cv::cvtColor(resized, rgb, cv::COLOR_BGR2RGB);
+    else if (cachedResized.channels() == 3) {
+        cv::cvtColor(cachedResized, rgb, cv::COLOR_BGR2RGB);
     }
     else {
-        rgb = resized.clone();
+        rgb = cachedResized.clone();
     }
 
     // Mat을 연속 메모리로 만들기 (중요!)
@@ -657,28 +755,20 @@ void CVisionTrackerUIDlg::ShowMatToStatic(const cv::Mat& mat, CStatic& ctrl)
             m_dibBuffer.resize(requiredSize);
             m_lastImageSize = currentSize;
             m_lastStride = stride;
-
-            // 디버그 정보 (선택사항)
-#ifdef _DEBUG
-            TRACE(_T("DIB buffer resized: %dx%d, stride=%d, size=%zu bytes\n"),
-                currentSize.width, currentSize.height, stride, requiredSize);
-#endif
         }
 
-        // 패딩을 포함한 데이터 복사
-        // 병렬 처리를 위해 OpenMP 사용 가능 (프로젝트 설정에서 활성화 필요)
-#pragma omp parallel for
-        for (int y = 0; y < rgb.rows; y++) {
-            const BYTE* srcRow = rgb.ptr<BYTE>(y);
-            BYTE* dstRow = &m_dibBuffer[y * stride];
+        // 패딩을 포함한 데이터 복사 - 최적화된 버전
+        const int rowsCount = rgb.rows;
+        BYTE* dstData = m_dibBuffer.data();
+        const BYTE* srcData = rgb.data;
 
-            // 픽셀 데이터 복사
+        for (int y = 0; y < rowsCount; y++) {
+            BYTE* dstRow = dstData + y * stride;
+            const BYTE* srcRow = srcData + y * widthBytes;
+
             memcpy(dstRow, srcRow, widthBytes);
 
-            // 패딩 영역 0으로 초기화 (Windows 호환성)
-            if (padding > 0) {
-                memset(dstRow + widthBytes, 0, padding);
-            }
+            // 패딩 영역은 초기화 불필요 (Windows가 무시함)
         }
 
         imageData = m_dibBuffer.data();
@@ -775,9 +865,17 @@ void CVisionTrackerUIDlg::OnTimer(UINT_PTR nIDEvent)
             double processingTimeMs = GetLastDetectionTimeMs();
 
             if (found) {
-                // 공의 위치에 초록색 원 그리기
-                cv::circle(disp, cv::Point((int)x, (int)y), (int)radius, cv::Scalar(0, 255, 0), 2);
-                cv::circle(disp, cv::Point((int)x, (int)y), 2, cv::Scalar(0, 0, 255), -1);
+                // 볼 위치를 ROI 기준으로 변환 (DLL이 원본 좌표를 반환하므로)
+                float displayX = x - m_i_cropposx;
+                float displayY = y - m_i_cropposy;
+
+                // ROI 내에 있는지 확인
+                if (displayX >= 0 && displayY >= 0 &&
+                    displayX < disp.cols && displayY < disp.rows) {
+                    // 공의 위치에 초록색 원 그리기
+                    cv::circle(disp, cv::Point((int)displayX, (int)displayY), (int)radius, cv::Scalar(0, 255, 0), 2);
+                    cv::circle(disp, cv::Point((int)displayX, (int)displayY), 2, cv::Scalar(0, 0, 255), -1);
+                }
 
                 // 좌표 정보와 처리 시간 표시
                 CString info;
@@ -845,7 +943,7 @@ void CVisionTrackerUIDlg::OnDestroy()
 
 void CVisionTrackerUIDlg::OnOK()
 {
-    // 아무 작업도 하지 않음으로써 Enter 키로 종료되는 현상을 막음
+    // Enter 키로 종료되는 현상 방지
 }
 
 HBRUSH CVisionTrackerUIDlg::OnCtlColor(CDC* pDC, CWnd* pWnd, UINT nCtlColor)

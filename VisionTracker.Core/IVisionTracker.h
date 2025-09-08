@@ -57,16 +57,12 @@ extern WhiteBallDetectionConfig g_whiteBallConfig;
 
 // C 스타일 인터페이스
 extern "C" {
-    // 에러 메시지 전달용
+    // 에러 메시지 및 통계 전달용
     VISIONTRACKER_API const char* GetLastErrorMessage();
 
     // 카메라 검색 및 연결
     VISIONTRACKER_API int EnumerateCameras(CameraInfo* cameras, int maxCount);
     VISIONTRACKER_API bool ConnectCameraByIndex(int index);
-    VISIONTRACKER_API bool ConnectCameraByIndexAsync(int index); // 비동기 연결
-    VISIONTRACKER_API int GetConnectionStatus(); // 0: 미연결, 1: 연결중, 2: 연결됨, -1: 실패
-    VISIONTRACKER_API void SetRetryPolicy(int maxAttempts, int initialDelayMs,
-        int maxDelayMs, bool useExponentialBackoff);
     VISIONTRACKER_API bool DisconnectCamera();
     VISIONTRACKER_API bool IsConnected();
     VISIONTRACKER_API bool GetConnectedCameraInfo(CameraInfo* info);
@@ -82,10 +78,6 @@ extern "C" {
     // 영상 캡처 시작 및 중단
     VISIONTRACKER_API void StartGrab();
     VISIONTRACKER_API void StopGrab();
-
-    // 이미지 저장 시작 및 중단
-    VISIONTRACKER_API bool StartRecording(const char* folderPath);
-    VISIONTRACKER_API void StopRecording();
 
     // 최신 프레임 조회
     VISIONTRACKER_API bool GetLatestFrameInfo(int* width, int* height, int* channels);
